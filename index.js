@@ -129,7 +129,7 @@ uWS
                 res.cork(() => {
                   res.writeHeader(
                     "Set-Cookie",
-                    `appsaccurate_token=${result[0][1][0]}; HttpOnly; Secure; Path=/; SameSite=Strict`
+                    `appsaccurate_token=${result[0][1][0]}; HttpOnly; Path=/; SameSite=Strict`
                   );
                   res.writeHeader("Content-Type", "application/json");
                   res.end(JSON.stringify(["success", result[0][1][1]]));
@@ -356,6 +356,8 @@ uWS
                     params.push(result[0][1][2]); // insertkan userid accurate
                     callDbProcedure(dbFbName, fbSp, params, hasResult, res);
                   } else if (result?.[0]?.[1]?.[0] === "FbThenPg") {
+                    params.push(result[0][1][2]); // insertkan userid accurate
+                    console.log(result)
                     FbThenPg(params).then((result) => {
                       console.log(result, "hasil dari fbthenpg");
                       jsonRes(res, result, res.aborted);

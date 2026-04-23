@@ -1,6 +1,5 @@
 const Firebird = require('node-firebird');
 const { getFirebirdPool } = require('./dbFbPoolManager');
-const { executeQueryStream } = require('./executeQueryStreamFbBatch');
 const { callProcedurePg } = require("./dbPg");
 const { pgPool } = require('./configPg');
 
@@ -18,26 +17,38 @@ function getDdlFromPostgres(procName, callback) {
 }
 // Cek apakah procedure ada di Firebird
 function isProcedureExists(db, procName, callback) {
-  const upperName = procName.toUpperCase(); // Firebird: unquoted names = uppercase
+  const upperName = procName.toUpperCase();
+
   callProcedurePg('accurate.getddlspfb_version', ['6def3da0-ec48-4c49-8f40-be96201367f4', procName])
     .then(result => {
-      //dari sp pasti ada result jika tidak ada langsung di raise exeption
-      //callback(null, result[0][1][0]);
-      //kemudian cek di firebird nama procedure dan description,  jika tidak ada / descripition tidak sama maka return not exist
-      db.query(
-        'SELECT 1 FROM RDB$PROCEDURES WHERE RDB$PROCEDURE_NAME = ? AND RDB$DESCRIPTION = ?',
-        [upperName, result[0][1][0]],
-        (err, rows) => {
-          if (err) return callback(err);
-          callback(null, rows.length > 0);
-        }
-      );
+      const versionFromPg = String(result[0][1][0]);
+
+      // Gunakan transaksi agar 'statement' handle terjaga di socket Debian
+      db.transaction(Firebird.ISOLATION_READ_COMMITTED, (err, transaction) => {
+        if (err) return callback(err);
+
+        const sql = `
+          SELECT 1 FROM RDB$PROCEDURES 
+          WHERE RDB$PROCEDURE_NAME = ? 
+          AND CAST(RDB$DESCRIPTION AS VARCHAR(255)) = ?
+        `;
+
+        transaction.query(sql, [upperName, versionFromPg], (err, rows) => {
+          if (err) {
+            transaction.rollback();
+            return callback(err);
+          }
+
+          transaction.commit((commitErr) => {
+            if (commitErr) return callback(commitErr);
+            callback(null, Array.isArray(rows) && rows.length > 0);
+          });
+        });
+      });
     })
     .catch(err => {
-      console.error('getDdlFromPostgres error:', err);
-      return callback(err);
+      callback(err);
     });
-
 }
 
 // Buat procedure di Firebird dari DDL
@@ -65,15 +76,20 @@ function createProcedure(db, procname, ddl, version, callback) {
  * @param {function|null} callback - Callback jika tidak pakai streaming
  */
 function callDbProcedure(dbName, procName, params = [], hasResult = false, res) {
+  if (!/^[A-Z0-9_]+$/i.test(procName)) {
+    if (!res.aborted) {
+      res.cork(() => {
+        res.end(JSON.stringify(["__ERROR__", "Invalid procedure name : " + procName]) + "\n");
+      });
+    }
+    return;
+  }
   const fbPool = getFirebirdPool(dbName);
-
   fbPool.get((err, db) => {
     if (err) {
       if (!res.aborted) {
         res.cork(() => {
-          res.end(
-            JSON.stringify(["__ERROR__", "Database connection failed: " + err.message]) + "\n"
-          );
+          res.end(JSON.stringify(["__ERROR__", "Database connection failed: " + err.message]) + "\n");
         });
       }
       return;
@@ -84,14 +100,12 @@ function callDbProcedure(dbName, procName, params = [], hasResult = false, res) 
       return;
     }
 
-    if (fbPool.isdev === "Y")
+    if (fbPool.isdev === "Y") {
       isProcedureExists(db, procName, (err, exists) => {
         if (err) {
           if (!res.aborted) {
             res.cork(() => {
-              res.end(
-                JSON.stringify(["__ERROR__", "Failed to check procedure: " + err.message]) + "\n"
-              );
+              res.end(JSON.stringify(["__ERROR__", "Failed to check procedure: " + err.message]) + "\n");
             });
           }
           db.detach();
@@ -105,9 +119,7 @@ function callDbProcedure(dbName, procName, params = [], hasResult = false, res) 
             if (err) {
               if (!res.aborted) {
                 res.cork(() => {
-                  res.end(
-                    JSON.stringify(["__ERROR__", "getDdlFromPostgres error: " + err.message]) + "\n"
-                  );
+                  res.end(JSON.stringify(["__ERROR__", "getDdlFromPostgres error: " + err.message]) + "\n");
                 });
               }
               db.detach();
@@ -117,104 +129,96 @@ function callDbProcedure(dbName, procName, params = [], hasResult = false, res) 
               if (err) {
                 if (!res.aborted) {
                   res.cork(() => {
-                    res.end(
-                      JSON.stringify(["__ERROR__", "Failed to create procedure: " + err.message]) + "\n"
-                    );
+                    res.end(JSON.stringify(["__ERROR__", "Failed to create procedure: " + err.message]) + "\n");
                   });
                 }
                 db.detach();
                 return;
               }
-
               executeProcedure();
             });
           });
         }
       });
-    else
+    } else {
       executeProcedure();
+    }
 
     function executeProcedure() {
-      let headerAdded = false;
-
       if (res.aborted) {
         db.detach();
         return;
       }
 
-      res.cork(() => {
-        res.writeHeader("Content-Type", "application/x-ndjson");
-      });
-
+      if (!res.aborted) {
+        res.cork(() => {
+          res.writeHeader("Content-Type", "application/x-ndjson");
+        });
+      }
+      function safeWrite(fn) {
+        if (!res.aborted) {
+          res.cork(fn);
+        }
+      }
       const sql = hasResult
         ? `SELECT * FROM ${procName}(${params.map(() => '?').join(', ')})`
         : `EXECUTE PROCEDURE ${procName}(${params.map(() => '?').join(', ')})`;
 
-      db.transaction(Firebird.ISOLATION_SNAPSHOT, (err, trx) => {
-        if (err) {
-          if (!res.aborted) {
-            res.end(JSON.stringify(["__ERROR__", err.message]) + "\n");
-          }
-          db.detach();
-          return;
+      let headerAdded = false;
+      let headers = [];
+      let chunks = [];
+
+      db.sequentially(sql, params, (row, index) => {
+        if (!headerAdded) {
+          headers = Object.keys(row);
+          headerAdded = true;
+          chunks.push(JSON.stringify(["__BEGIN_SET__", "FB", procName]));
+          chunks.push(JSON.stringify(["__HEADER__", ...headers]));
         }
 
-        executeQueryStream(
-          trx,
-          sql,
-          params,
-          500,
-          (batchArray, header, headertype, isLast) => {
-            let chunks = [];
+        const rowArray = headers.map(col => row[col]);
+        chunks.push(JSON.stringify(rowArray));
 
-            if (!headerAdded && header.length > 0) {
-              chunks.push(JSON.stringify(["__BEGIN_SET__", "FB", procName]));
-              chunks.push(JSON.stringify(["__HEADER__", ...header]));
-              headerAdded = true;
-            }
-
-            for (const row of batchArray) {
-              chunks.push(JSON.stringify(row));
-            }
-
-            const payload = chunks.join("\n") + "\n";
-
-            if (!res.aborted) {
-              res.cork(() => {
-                res.write(payload);
-              });
-            }
-          }
-        )
-          .then(() => {
-            if (!res.aborted) {
-              res.cork(() => {
-                res.write(JSON.stringify(["__END_SET__"]) + "\n");
-                res.end();
-              });
-            }
-            trx.commit(() => db.detach());
-          })
-          .catch((err) => {
-            if (!res.aborted) {
-              res.cork(() => {
-                res.write(JSON.stringify(["__ERROR__", err.message]) + "\n");
-                res.end();
-              });
-            }
-            trx.rollback(() => db.detach());
+        if (chunks.length > 200) {
+          safeWrite(() => {
+            res.write(chunks.join("\n") + "\n");
           });
+          chunks = [];
+        }
+      }, (err) => {
+        if (chunks.length > 0) {
+          safeWrite(() => {
+            res.write(chunks.join("\n") + "\n");
+          });
+        }
+
+        if (err) {
+          safeWrite(() => {
+            res.write(JSON.stringify(["__ERROR__", err.message]) + "\n");
+            res.end();
+          });
+        } else {
+          safeWrite(() => {
+            res.write(JSON.stringify(["__END_SET__"]) + "\n");
+            res.end();
+          });
+        }
+
+        db.detach();
       });
     }
   });
 }
 
 async function FbThenPg(params) {
-  console.log(params, "oe")
   const fbDbName = params[2];
-  const fbProcName = params[5];
-  const pgProcName = params[6];
-  const spparams = params.slice(7);
+  const prefix = "FbThenPg";
+  let fbProcName = params[3];
+  if (params[3].startsWith(prefix)) {
+    fbProcName = params[3].slice(prefix.length);
+  }
+  const pgProcName = params[5];
+  const spparams = params.slice(6);
   const fbPool = getFirebirdPool(fbDbName);
   let pgClient = null;
 
@@ -271,10 +275,9 @@ async function FbThenPg(params) {
             if (!fbResult) {
               throw new Error('Data tidak ditemukan atau SP Firebird tidak mengembalikan hasil.');
             }
-            console.log(fbResult);
+            spparams.pop(); //keluarkan parameter iduser accurate
             spparams.push(JSON.stringify(fbResult));
             spparams.unshift(params[0], params[1], params[2]);
-            console.log(spparams)
             pgClient = await pgPool.connect();
             await pgClient.query('BEGIN');
 
@@ -318,7 +321,7 @@ async function FbThenPg(params) {
 }
 
 function initDbFirebird(params = [], res) {
-  
+
   const dbName = params[2];
   const fbPool = getFirebirdPool(dbName);
 
@@ -346,7 +349,7 @@ function initDbFirebird(params = [], res) {
     }
 
     if (fbPool.isdev === "Y") {
-      callProcedurePg('accurate.getDdlDbInitFirebird', ['6def3da0-ec48-4c49-8f40-be96201367f4',params[5]])
+      callProcedurePg('accurate.getDdlDbInitFirebird', ['6def3da0-ec48-4c49-8f40-be96201367f4', params[5]])
         .then(result => {
 
           const ddlList = result[0].slice(1).map(row => row[0]); // ambil semua SQL
