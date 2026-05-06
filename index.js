@@ -132,7 +132,7 @@ uWS
                     `appsaccurate_token=${result[0][1][0]}; HttpOnly; Path=/; SameSite=Strict`
                   );
                   res.writeHeader("Content-Type", "application/json");
-                  res.end(JSON.stringify(["success", result[0][1][1]]));
+                  res.end(JSON.stringify(["success", result[0][1][1],result[0][1][2]]));
                 });
             })
             .catch((err) => {
@@ -333,6 +333,57 @@ uWS
               params[4],
             ])
               .then((result) => {
+                if (result?.[0]?.[0]?.[0] === "callsp") {
+                  if (result?.[0]?.[1]?.[0] === "callDbProcedure") {
+                    params.shift(); //hapus param idsession
+                    params.shift(); //hapus param path
+                    const dbFbName = params.shift(); //ambil dan hapus param dbname
+                    const fbSp = params.shift(); //ambil dan hapus param nama store procedure
+                    params.push(result[0][1][2]); // insertkan userid accurate
+                    callDbProcedure(dbFbName, fbSp, params, hasResult, res);
+                  } else if (result?.[0]?.[1]?.[0] === "FbThenPg") {
+                    params.push(result[0][1][2]); // insertkan userid accurate
+                    console.log(result)
+                    FbThenPg(params).then((result) => {
+                      console.log(result, "hasil dari fbthenpg");
+                      jsonRes(res, result, res.aborted);
+                    })
+                      .catch((err) => {
+                        // handle error
+                        console.error("Error call FbThenPg:", err);
+                        jsonRes(res, ["__ERROR__", err.message], res.aborted);
+                      });
+                  } else {
+                    jsonRes(
+                      res,
+                      ["__ERROR__", "Procedure " + result?.[0]?.[1]?.[0] + " tidak ditemukan."],
+                      res.aborted
+                    );
+                  }
+                } else
+                  jsonRes(
+                    res,
+                    ["__ERROR__", "Output callsp tidak ditemukan."],
+                    res.aborted
+                  );
+              })
+              .catch((err) => {
+                // handle error
+                console.error("Error call procedure:", err);
+                jsonRes(res, ["__ERROR__", err.message], res.aborted);
+              });
+          } else if (proc === "accurate.verify_actions_confirm") {
+            // untuk akses ke store procedure firebird
+            callProcedurePg(proc, [
+              params[0],
+              params[1],
+              params[2],
+              params[3],
+              params[4],
+              params[5],
+            ])
+              .then((result) => {
+                params.splice(5, 1); //hapus param password confirm
                 if (result?.[0]?.[0]?.[0] === "callsp") {
                   if (result?.[0]?.[1]?.[0] === "loadAllDbConfigs") {
                     loadAllDbConfigs()
