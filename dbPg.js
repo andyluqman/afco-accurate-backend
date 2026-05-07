@@ -40,12 +40,7 @@ async function callProcedurePgNdjson(procName, params, res, signal) {
   let client;
   activeResponses.add(res);
   if (procName === "accurate.settingdatabase_manage") params.push(fbkey);
-  // Header NDJSON harus dikirim segera
-  if (!res.aborted)
-    res.cork(() => {
-      res.writeHeader("Content-Type", "application/x-ndjson");
-    });
-
+  
   if (signal?.aborted) {
     activeResponses.delete(res);
     console.log("Client disconnected, aborting processes...");
@@ -169,13 +164,6 @@ async function callProcedurePgNdjson(procName, params, res, signal) {
       } catch (rlsError) {
         console.error("Release failed:", rlsError);
       }
-    }
-
-    if (!res.aborted) {
-      activeResponses.delete(res);
-      res.cork(() => {
-        res.end();
-      });
     }
   }
 }

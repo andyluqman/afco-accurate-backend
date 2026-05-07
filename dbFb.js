@@ -79,7 +79,7 @@ function callDbProcedure(dbName, procName, params = [], hasResult = false, res) 
   if (!/^[A-Z0-9_]+$/i.test(procName)) {
     if (!res.aborted) {
       res.cork(() => {
-        res.end(JSON.stringify(["__ERROR__", "Invalid procedure name : " + procName]) + "\n");
+        res.write(JSON.stringify(["__ERROR__", "Invalid procedure name : " + procName]) + "\n");
       });
     }
     return;
@@ -89,7 +89,7 @@ function callDbProcedure(dbName, procName, params = [], hasResult = false, res) 
     if (err) {
       if (!res.aborted) {
         res.cork(() => {
-          res.end(JSON.stringify(["__ERROR__", "Database connection failed: " + err.message]) + "\n");
+          res.write(JSON.stringify(["__ERROR__", "Database connection failed: " + err.message]) + "\n");
         });
       }
       return;
@@ -105,7 +105,7 @@ function callDbProcedure(dbName, procName, params = [], hasResult = false, res) 
         if (err) {
           if (!res.aborted) {
             res.cork(() => {
-              res.end(JSON.stringify(["__ERROR__", "Failed to check procedure: " + err.message]) + "\n");
+              res.write(JSON.stringify(["__ERROR__", "Failed to check procedure: " + err.message]) + "\n");
             });
           }
           db.detach();
@@ -119,7 +119,7 @@ function callDbProcedure(dbName, procName, params = [], hasResult = false, res) 
             if (err) {
               if (!res.aborted) {
                 res.cork(() => {
-                  res.end(JSON.stringify(["__ERROR__", "getDdlFromPostgres error: " + err.message]) + "\n");
+                  res.write(JSON.stringify(["__ERROR__", "getDdlFromPostgres error: " + err.message]) + "\n");
                 });
               }
               db.detach();
@@ -129,7 +129,7 @@ function callDbProcedure(dbName, procName, params = [], hasResult = false, res) 
               if (err) {
                 if (!res.aborted) {
                   res.cork(() => {
-                    res.end(JSON.stringify(["__ERROR__", "Failed to create procedure: " + err.message]) + "\n");
+                    res.write(JSON.stringify(["__ERROR__", "Failed to create procedure: " + err.message]) + "\n");
                   });
                 }
                 db.detach();
@@ -144,69 +144,65 @@ function callDbProcedure(dbName, procName, params = [], hasResult = false, res) 
       executeProcedure();
     }
 
-    function executeProcedure() {
-      if (res.aborted) {
-        db.detach();
-        return;
-      }
+function executeProcedure() {
+       if (res.aborted) {
+         db.detach();
+         return;
+       }
 
-      if (!res.aborted) {
-        res.cork(() => {
-          res.writeHeader("Content-Type", "application/x-ndjson");
-        });
-      }
-      function safeWrite(fn) {
-        if (!res.aborted) {
-          res.cork(fn);
-        }
-      }
-      const sql = hasResult
-        ? `SELECT * FROM ${procName}(${params.map(() => '?').join(', ')})`
-        : `EXECUTE PROCEDURE ${procName}(${params.map(() => '?').join(', ')})`;
+       function safeWrite(fn) {
+         if (!res.aborted) {
+           res.cork(fn);
+         }
+       }
+       const sql = hasResult
+         ? `SELECT * FROM ${procName}(${params.map(() => '?').join(', ')})`
+         : `EXECUTE PROCEDURE ${procName}(${params.map(() => '?').join(', ')})`;
 
-      let headerAdded = false;
-      let headers = [];
-      let chunks = [];
+       let headerAdded = false;
+       let headers = [];
+       let chunks = [];
 
-      db.sequentially(sql, params, (row, index) => {
-        if (!headerAdded) {
-          headers = Object.keys(row);
-          headerAdded = true;
-          chunks.push(JSON.stringify(["__BEGIN_SET__", "FB", procName]));
-          chunks.push(JSON.stringify(["__HEADER__", ...headers]));
-        }
+       db.sequentially(sql, params, (row, index) => {
+         if (!headerAdded) {
+           headers = Object.keys(row);
+           headerAdded = true;
+           chunks.push(JSON.stringify(["__BEGIN_SET__", "FB", procName]));
+           chunks.push(JSON.stringify(["__HEADER__", ...headers]));
+           console.log("db header sent")
+         }
 
-        const rowArray = headers.map(col => row[col]);
-        chunks.push(JSON.stringify(rowArray));
+         const rowArray = headers.map(col => row[col]);
+         chunks.push(JSON.stringify(rowArray));
 
-        if (chunks.length > 200) {
-          safeWrite(() => {
-            res.write(chunks.join("\n") + "\n");
-          });
-          chunks = [];
-        }
-      }, (err) => {
-        if (chunks.length > 0) {
-          safeWrite(() => {
-            res.write(chunks.join("\n") + "\n");
-          });
-        }
+         if (chunks.length > 200) {
+           safeWrite(() => {
+             res.write(chunks.join("\n") + "\n");
+           });
+           chunks = [];
+         }
+       }, (err) => {
+         if (chunks.length > 0) {
+          console.log(chunks)
+           safeWrite(() => {
+             res.write(chunks.join("\n") + "\n");
+           });
+         }
 
-        if (err) {
-          safeWrite(() => {
-            res.write(JSON.stringify(["__ERROR__", err.message]) + "\n");
-            res.end();
-          });
-        } else {
-          safeWrite(() => {
-            res.write(JSON.stringify(["__END_SET__"]) + "\n");
-            res.end();
-          });
-        }
+         if (err) {
+           safeWrite(() => {
+             res.write(JSON.stringify(["__ERROR__", err.message]) + "\n");
+           });
+         } else {
+          console.log("end set")
+           safeWrite(() => {
+             res.write(JSON.stringify(["__END_SET__"]) + "\n");
+           });
+         }
 
-        db.detach();
-      });
-    }
+         db.detach();
+       });
+     }
   });
 }
 
