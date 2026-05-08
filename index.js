@@ -397,6 +397,7 @@ uWS
                 });
           }
         } else if (proc === "accurate.verify_actions_confirm") {
+          params.unshift(sessionId);
           // untuk akses ke store procedure firebird
           const result = await callProcedurePg(proc, [
             params[0],
@@ -463,6 +464,7 @@ uWS
                   res.write(JSON.stringify(["__ERROR__", "Output callsp tidak ditemukan."]));
                 });
         } else {
+          params.unshift(sessionId);
           await callProcedurePgNdjson(proc, params, res, signal);
         }
       } catch (err) {
