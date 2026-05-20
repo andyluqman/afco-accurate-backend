@@ -144,65 +144,65 @@ function callDbProcedure(dbName, procName, params = [], hasResult = false, res) 
       executeProcedure();
     }
 
-function executeProcedure() {
-       if (res.aborted) {
-         db.detach();
-         return;
-       }
+    function executeProcedure() {
+      if (res.aborted) {
+        db.detach();
+        return;
+      }
 
-       function safeWrite(fn) {
-         if (!res.aborted) {
-           res.cork(fn);
-         }
-       }
-       const sql = hasResult
-         ? `SELECT * FROM ${procName}(${params.map(() => '?').join(', ')})`
-         : `EXECUTE PROCEDURE ${procName}(${params.map(() => '?').join(', ')})`;
+      function safeWrite(fn) {
+        if (!res.aborted) {
+          res.cork(fn);
+        }
+      }
+      const sql = hasResult
+        ? `SELECT * FROM ${procName}(${params.map(() => '?').join(', ')})`
+        : `EXECUTE PROCEDURE ${procName}(${params.map(() => '?').join(', ')})`;
 
-       let headerAdded = false;
-       let headers = [];
-       let chunks = [];
+      let headerAdded = false;
+      let headers = [];
+      let chunks = [];
 
-       db.sequentially(sql, params, (row, index) => {
-         if (!headerAdded) {
-           headers = Object.keys(row);
-           headerAdded = true;
-           chunks.push(JSON.stringify(["__BEGIN_SET__", "FB", procName]));
-           chunks.push(JSON.stringify(["__HEADER__", ...headers]));
-           console.log("db header sent")
-         }
+      db.sequentially(sql, params, (row, index) => {
+        if (!headerAdded) {
+          headers = Object.keys(row);
+          headerAdded = true;
+          chunks.push(JSON.stringify(["__BEGIN_SET__", "FB", procName]));
+          chunks.push(JSON.stringify(["__HEADER__", ...headers]));
+          console.log("db header sent")
+        }
 
-         const rowArray = headers.map(col => row[col]);
-         chunks.push(JSON.stringify(rowArray));
+        const rowArray = headers.map(col => row[col]);
+        chunks.push(JSON.stringify(rowArray));
 
-         if (chunks.length > 200) {
-           safeWrite(() => {
-             res.write(chunks.join("\n") + "\n");
-           });
-           chunks = [];
-         }
-       }, (err) => {
-         if (chunks.length > 0) {
+        if (chunks.length > 200) {
+          safeWrite(() => {
+            res.write(chunks.join("\n") + "\n");
+          });
+          chunks = [];
+        }
+      }, (err) => {
+        if (chunks.length > 0) {
           console.log(chunks)
-           safeWrite(() => {
-             res.write(chunks.join("\n") + "\n");
-           });
-         }
+          safeWrite(() => {
+            res.write(chunks.join("\n") + "\n");
+          });
+        }
 
-         if (err) {
-           safeWrite(() => {
-             res.write(JSON.stringify(["__ERROR__", err.message]) + "\n");
-           });
-         } else {
+        if (err) {
+          safeWrite(() => {
+            res.write(JSON.stringify(["__ERROR__", err.message]) + "\n");
+          });
+        } else {
           console.log("end set")
-           safeWrite(() => {
-             res.write(JSON.stringify(["__END_SET__"]) + "\n");
-           });
-         }
+          safeWrite(() => {
+            res.write(JSON.stringify(["__END_SET__"]) + "\n");
+          });
+        }
 
-         db.detach();
-       });
-     }
+        db.detach();
+      });
+    }
   });
 }
 
@@ -252,8 +252,14 @@ async function FbThenPg(params) {
       else
         executeProcedure();
 
+      const transaction_options = {
+        isolation: Firebird.ISOLATION_READ_COMMITTED,
+        readOnly: false,
+        wait: false,
+      };
+
       function executeProcedure() {
-        fbConn.transaction(Firebird.ISOLATION_READ_COMMITTED, async (err, fbTx) => {
+        fbConn.transaction(transaction_options, async (err, fbTx) => {
           if (err) {
             fbConn.detach();
             return reject(err);

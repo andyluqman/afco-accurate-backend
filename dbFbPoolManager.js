@@ -28,7 +28,7 @@ function getFirebirdPool(dbName) {
   const { getDbConfig } = require('./configFb');
   const dbConfig = getDbConfig(name);
   if (!dbConfig) {
-    throw new Error(`Konfigurasi DB ${name} tidak ditemukan`);
+    throw new Error(`DbPoolManager : Konfigurasi DB ${name} tidak ditemukan`);
   }
 
   const pool = Firebird.pool(MAX_CONNECTIONS_PER_DB, dbConfig);

@@ -1,6 +1,5 @@
 const uWS = require("uWebSockets.js");
-const { FbThenPg, initDbFirebird } = require("./dbFb");
-const { callDbProcedure } = require("./dbFbAsync");
+const { callFbSp, FbThenPg } = require("./dbFbAsync");
 const { callProcedurePg, callProcedurePgNdjson } = require("./dbPg");
 const { loadAllDbConfigs } = require("./configFb");
 const fs = require("fs");
@@ -54,7 +53,7 @@ function jsonRes(res, data) {
     res.cork(() => {
       res.writeStatus(`200 OK`);
       res.writeHeader("Content-Type", "application/json");
-      res.write(JSON.stringify(data));
+      res.end(JSON.stringify(data));
     });
 }
 
@@ -144,25 +143,6 @@ uWS
       console.log("Client aborted connection");
     });
 
-    (async () => {
-      let responseBody = '';
-      let status = '200 OK';
-
-      try {
-        const body = await readBody(res);
-
-      } catch (err) {
-        responseBody = JSON.stringify({ error: err.message });
-      } finally {
-        if (!aborted) {
-          res.writeStatus(status)
-            .writeHeader('Content-Type', 'application/json')
-            .end(responseBody);
-        }
-      }
-    })();
-
-
     res.onData((chunk, isLast) => {
       body += Buffer.from(chunk).toString();
       if (body.length > MAX_BODY_SIZE) {
@@ -185,7 +165,7 @@ uWS
                 res.cork(() => {
                   res.writeHeader(
                     "Set-Cookie",
-                    `appsaccurate_token=${result[0][1][0]}; HttpOnly; Path=/; SameSite=Strict`
+                    `appsaccurate_token=${result[0][1][0]}; HttpOnly; Secure; Path=/; SameSite=Strict`
                   );
                   res.writeHeader("Content-Type", "application/json");
                   res.end(JSON.stringify(["success", result[0][1][1], result[0][1][2]]));
@@ -254,7 +234,7 @@ uWS
             res.cork(() => {
               res.writeHeader(
                 "Set-Cookie",
-                `appsaccurate_token=; HttpOnly; Path=/; SameSite=Strict`
+                `appsaccurate_token=; HttpOnly; Secure; Path=/; SameSite=Strict`
               );
               res.writeHeader("Content-Type", "application/json");
               res.end(JSON.stringify(result));
@@ -283,10 +263,17 @@ uWS
 
     (async () => {
       try {
+        if (!res.aborted)
+          res.cork(() => {
+            res.writeHeader("Content-Type", "application/x-ndjson");
+          });
         const body = await readBody(res);
         const sessionId = cookieHeader.match(/appsaccurate_token=([^;]+)/)?.[1];
         if (!sessionId) {
-          jsonRes(res, ["__ERROR__", "Session expired / tidak ditemukan."], res.aborted);
+          if (!res.aborted)
+            res.cork(() => {
+              res.write(JSON.stringify(["__ERROR__", "Session expired / tidak ditemukan."]));
+            });
           return;
         }
         const now = new Date();
@@ -305,7 +292,10 @@ uWS
           });
         await callProcedurePgNdjson("accurate.verify_user", params, res, signal);
       } catch (err) {
-        jsonRes(res, ["__ERROR__", err.message], res.aborted);
+        if (!res.aborted)
+          res.cork(() => {
+            res.write(JSON.stringify(["__ERROR__", err.message]));
+          });
       } finally {
         if (!res.aborted)
           res.cork(() => {
@@ -350,119 +340,16 @@ uWS
         const body = JSON.parse(raw);
         const params = body.params || [];
         const hasResult = String(body.hasResult ?? "false").toLowerCase() === "true";
-        if (proc === "accurate.verify_actions") {
-          pPath = params.shift();
-          const is2D = Array.isArray(params[0]) && params.every(p => Array.isArray(p));
-          if (is2D) {
+        if (proc === "accurate.verify_actions" || proc === "accurate.verify_actions_confirm") { //execute procedur di firebird tapi di verifikasi dahulu di postgres
+          const pPath = params.shift();
+          await callFbSp(proc, sessionId, pPath, params, hasResult, res);
+        } else if (proc === "accurate.fbthenpg") {
+          params.push(result[0][1][2]); // insertkan userid accurate
+          const resFbThenPg = await FbThenPg(params);
+          if (!res.aborted)
             res.cork(() => {
-              res.writeHeader("Content-Type", "application/x-ndjson");
+              res.write(JSON.stringify(resFbThenPg));
             });
-            for (let index = 0; index < params.length; index++) {
-              await callSp(params[index]);
-            }
-          } else {
-            await callSp(params);
-          }
-
-          async function callSp(myParams) {
-            const result = await callProcedurePg(proc, [
-              sessionId,
-              pPath,
-              myParams[0],
-              myParams[1],
-              myParams[2],
-            ]);
-            if (result?.[0]?.[0]?.[0] === "callsp") {
-              if (result?.[0]?.[1]?.[0] === "callDbProcedure") {
-                const dbFbName = myParams.shift(); //ambil dan hapus param dbname
-                const fbSp = myParams.shift(); //ambil dan hapus param nama store procedure
-                myParams.push(result[0][1][2]); // insertkan userid accurate
-                await callDbProcedure(dbFbName, fbSp, myParams, hasResult, res);
-              } else if (result?.[0]?.[1]?.[0] === "FbThenPg") {
-                myParams.push(result[0][1][2]); // insertkan userid accurate
-                const resFbThenPg = await FbThenPg(myParams);
-                res.cork(() => {
-                  res.write(JSON.stringify(resFbThenPg));
-                });
-              } else {
-                if (!res.aborted)
-                  res.cork(() => {
-                    res.write(JSON.stringify(["__ERROR__", "Procedure " + result?.[0]?.[1]?.[0] + " tidak ditemukan."]));
-                  });
-              }
-            } else
-              if (!res.aborted)
-                res.cork(() => {
-                  res.write(JSON.stringify(["__ERROR__", "Output callsp tidak ditemukan."]));
-                });
-          }
-        } else if (proc === "accurate.verify_actions_confirm") {
-          params.unshift(sessionId);
-          // untuk akses ke store procedure firebird
-          const result = await callProcedurePg(proc, [
-            params[0],
-            params[1],
-            params[2],
-            params[3],
-            params[4],
-            params[5],
-          ]);
-          params.splice(5, 1); //hapus param password confirm
-          if (result?.[0]?.[0]?.[0] === "callsp") {
-            if (result?.[0]?.[1]?.[0] === "loadAllDbConfigs") {
-              loadAllDbConfigs()
-                .then((jml) => {
-                  console.log(jml + " konfigurasi db fb berhasil dimuat.");
-                  if (!res.aborted)
-                    res.cork(() => {
-                      res.write(JSON.stringify(["success", jml + " Konfigurasi db fb berhasil dimuat."]));
-                    });
-                })
-                .catch((err) => {
-                  console.error("Gagal memuat konfigurasi db fb:", err);
-                  if (!res.aborted)
-                    res.cork(() => {
-                      res.write(JSON.stringify(["__ERROR__", err.message]));
-                    });
-                });
-            } else if (result?.[0]?.[1]?.[0] === "callDbProcedure") {
-              params.shift(); //hapus param idsession
-              params.shift(); //hapus param path
-              const dbFbName = params.shift(); //ambil dan hapus param dbname
-              const fbSp = params.shift(); //ambil dan hapus param nama store procedure
-              params.push(result[0][1][2]); // insertkan userid accurate
-              await callDbProcedure(dbFbName, fbSp, params, hasResult, res);
-            } else if (result?.[0]?.[1]?.[0] === "FbThenPg") {
-              params.push(result[0][1][2]); // insertkan userid accurate
-              console.log(result)
-              FbThenPg(params).then((result) => {
-                console.log(result, "hasil dari fbthenpg");
-                if (!res.aborted)
-                  res.cork(() => {
-                    res.write(JSON.stringify(result));
-                  });
-              })
-                .catch((err) => {
-                  // handle error
-                  console.error("Error call FbThenPg:", err);
-                  if (!res.aborted)
-                    res.cork(() => {
-                      res.write(JSON.stringify(["__ERROR__", err.message]));
-                    });
-                });
-            } else if (result?.[0]?.[1]?.[0] === "initDbAccurate") {
-              initDbFirebird(params, res);
-            } else {
-              if (!res.aborted)
-                res.cork(() => {
-                  res.write(JSON.stringify(["__ERROR__", "Procedure " + result?.[0]?.[1]?.[0] + " tidak ditemukan."]));
-                });
-            }
-          } else
-            if (!res.aborted)
-                res.cork(() => {
-                  res.write(JSON.stringify(["__ERROR__", "Output callsp tidak ditemukan."]));
-                });
         } else {
           params.unshift(sessionId);
           await callProcedurePgNdjson(proc, params, res, signal);
@@ -484,7 +371,7 @@ uWS
     res.onAborted(() => {
       console.warn("Request aborted by client");
     });
-    handleStaticRequest(req, res, "dist", "/");
+    handleStaticRequest(req, res, "dist", "/accurate/");
   })
   .listen(3030, (token) => {
     if (token) {

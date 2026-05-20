@@ -36,15 +36,25 @@ async function safeCloseCursor(client, cursorName) {
  * @param {Array} params - Parameter yang akan diteruskan ke stored function.
  * @param {Object} res - Objek respons HTTP untuk streaming NDJSON.
  */
-async function callProcedurePgNdjson(procName, params, res, signal) {
+async function callProcedurePgNdjson(rawProcName, params, res, signal) {
+  const raw = decodeURIComponent(rawProcName);
+  const lastDot = raw.lastIndexOf(".");
+  if (lastDot === -1) {
+    throw new Error("Format invalid");
+  }
+  const procName = `"${raw.substring(0, lastDot)}".${raw.substring(lastDot + 1)}`;
   let client;
   activeResponses.add(res);
-  if (procName === "accurate.settingdatabase_manage") params.push(fbkey);
-  
+  if (procName === `"accurate".settingdatabase_manage`) params.push(fbkey);
   if (signal?.aborted) {
     activeResponses.delete(res);
     console.log("Client disconnected, aborting processes...");
   }
+
+  if (!res.aborted)
+    res.cork(() => {
+      res.writeHeader("Content-Type", "application/x-ndjson");
+    });
 
   try {
     client = await pgPool.connect();

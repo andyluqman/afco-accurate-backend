@@ -8,6 +8,7 @@ const dbConfigCache = {};
 
 function loadAllDbConfigs() {
   return new Promise((resolve, reject) => {
+    console.log("loadalldbconfig")
     callProcedurePg('accurate.settingdatabase_manage',['6def3da0-ec48-4c49-8f40-be96201367f4', '/databases', 'VIEW', null, '', '', '', '', '', '', '', '', '', '', '', process.env.FB_KEY])
       .then(result => {
         // Reset isi cache (ingat: ini harus pakai let atau delete tiap key kalau pakai const)
@@ -15,7 +16,6 @@ function loadAllDbConfigs() {
           delete dbConfigCache[key];
         }
         console.log("reset dbConfigCache");
-
         for (let i = 1; i < result[1].length; i++) {
           const row = result[1][i];
 
