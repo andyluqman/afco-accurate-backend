@@ -1,24 +1,6 @@
 const { pgPool } = require('./configPg');
 const { activeResponses } = require("./connections");
 const fbkey = process.env.FB_KEY;
-/**
- * Fungsi untuk menulis baris JSON ke respons HTTP, dienkapsulasi dalam 'cork'
- * untuk kinerja I/O yang lebih baik (umum di lingkungan uWS/µWS).
- *
- * @param {Object} res - Objek respons HTTP (uWS/Express-like).
- * @param {Array|Object} data - Data untuk di-JSON.stringify.
- * @param {boolean} isError - Flag jika ini adalah pesan error.
- */
-function writeNdjsonRow(res, data, isError = false) {
-  if (isError) console.log('@@@@@@@@@@@@', data)
-  const prefix = isError ? JSON.stringify(["__ERROR__", data.message || data]) : JSON.stringify(data);
-  const jsonRow = prefix + "\n";
-  // Gunakan res.cork() atau mekanisme penulisan non-blocking lain yang sesuai dengan framework Anda
-  if (!res.aborted)
-    res.cork(() => {
-      res.write(jsonRow);
-    });
-}
 async function safeCloseCursor(client, cursorName) {
   try {
     await client.query(`CLOSE "${cursorName}"`);
@@ -37,6 +19,17 @@ async function safeCloseCursor(client, cursorName) {
  * @param {Object} res - Objek respons HTTP untuk streaming NDJSON.
  */
 async function callProcedurePgNdjson(rawProcName, params, res, signal) {
+  function writeNdjsonRow(res, data, isError = false) {
+    if (isError) console.log('@@@@@@@@@@@@', data)
+    const prefix = isError ? JSON.stringify(["__ERROR__", data.message || data]) : JSON.stringify(data);
+    const jsonRow = prefix + "\n";
+    // Gunakan res.cork() atau mekanisme penulisan non-blocking lain yang sesuai dengan framework Anda
+    if (!signal.aborted)
+      res.cork(() => {
+        res.write(jsonRow);
+      });
+  }
+
   const raw = decodeURIComponent(rawProcName);
   const lastDot = raw.lastIndexOf(".");
   if (lastDot === -1) {
@@ -51,7 +44,7 @@ async function callProcedurePgNdjson(rawProcName, params, res, signal) {
     console.log("Client disconnected, aborting processes...");
   }
 
-  if (!res.aborted)
+  if (!signal.aborted)
     res.cork(() => {
       res.writeHeader("Content-Type", "application/x-ndjson");
     });
@@ -64,7 +57,7 @@ async function callProcedurePgNdjson(rawProcName, params, res, signal) {
     const sqltext = `SELECT * FROM ${procName}(${placeholders})`;
     const mainRes = await client.query({ text: sqltext, values: params, rowMode: "array" });
 
-    if (res.aborted) {
+    if (signal.aborted) {
       await client.query('ROLLBACK');
       return;
     }
@@ -108,7 +101,7 @@ async function callProcedurePgNdjson(rawProcName, params, res, signal) {
 
       // Loop untuk FETCH berulang kali
       while (hasMore) {
-        if (res.aborted) {
+        if (signal.aborted) {
           await client.query('ROLLBACK');
           return;
         }
@@ -132,7 +125,7 @@ async function callProcedurePgNdjson(rawProcName, params, res, signal) {
         } else {
           // Streaming setiap baris data
           for (const row of cursorRes.rows) {
-            if (res.aborted) {
+            if (signal.aborted) {
               await client.query('ROLLBACK');
               return;
             }
@@ -163,7 +156,7 @@ async function callProcedurePgNdjson(rawProcName, params, res, signal) {
         console.error("Rollback failed:", rbError);
       }
     }
-    if (!res.aborted) {
+    if (!signal.aborted) {
       writeNdjsonRow(res, e.message || e.error, true);
     }
     //throw e;

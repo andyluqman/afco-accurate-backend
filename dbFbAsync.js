@@ -50,7 +50,7 @@ function rollbackAsync(trx) {
     });
 }
 
-export async function callFbSp(proc, sessionId, pPath, params, hasResult, res) {
+export async function callFbSp(proc, sessionId, pPath, params, hasResult, res, signal) {
     let dbName;
     const is2D = Array.isArray(params[0]) && params.every(p => Array.isArray(p));
     const params2D = is2D ? params : [params];
@@ -75,13 +75,13 @@ export async function callFbSp(proc, sessionId, pPath, params, hasResult, res) {
             if (result?.[0]?.[1]?.[0] === "loadAllDbConfigs") {
                 const jml = await loadAllDbConfigs();
                 console.log(jml + " konfigurasi db fb berhasil dimuat.");
-                if (!res.aborted)
+                if (!signal.aborted)
                     res.cork(() => {
                         res.writeHeader("Content-Type", "application/json");
                         res.write(JSON.stringify(["success", jml + " Konfigurasi db fb berhasil dimuat."]));
                     });
             } else {
-                if (!res.aborted)
+                if (!signal.aborted)
                     res.cork(() => {
                         res.writeHeader("Content-Type", "application/json");
                         res.write(JSON.stringify(["__ERROR__", "Procedure " + result?.[0]?.[1]?.[0] + " tidak ditemukan."]));
@@ -134,13 +134,11 @@ export async function callFbSp(proc, sessionId, pPath, params, hasResult, res) {
                     const dbFbName = myParams.shift(); //ambil dan hapus param dbname
                     const fbSp = myParams.shift(); //ambil dan hapus param nama store procedure
                     myParams.push(result[0][1][2]); // insertkan userid accurate
-                    await executeProcedureAsync(trx, fbSp, myParams, hasResult, res);
+                    await executeProcedureAsync(trx, fbSp, myParams, hasResult, res, signal);
                 } else if (result?.[0]?.[1]?.[0] === "initDbFirebird") {
-                    await initDbFirebird(params, res);
-                } else if (result?.[0]?.[1]?.[0] === "initDbPostgresql") {
-                    await initDbPostgresql(params, res);
+                    await initDbFirebird(params, res, signal);
                 } else {
-                    if (!res.aborted)
+                    if (!signal.aborted)
                         res.cork(() => {
                             res.writeHeader("Content-Type", "application/json");
                             res.write(JSON.stringify(["__ERROR__", "Procedure " + result?.[0]?.[1]?.[0] + " tidak ditemukan."]));
@@ -172,9 +170,10 @@ async function executeProcedureAsync(
     procName,
     params,
     hasResult,
-    res
+    res,
+    signal
 ) {
-    if (res.aborted) return;
+    if (signal.aborted) return;
 
     if (!/^[A-Z0-9_]+$/i.test(procName)) {
         throw new Error(`ExecuteProcedureAsync -> Invalid procedure name : ${procName}`);
@@ -182,7 +181,7 @@ async function executeProcedureAsync(
 
     function safeWrite(data) {
         try {
-            if (!res.aborted) {
+            if (!signal.aborted) {
                 res.cork(() => {
                     res.write(data);
                 });
@@ -265,7 +264,7 @@ async function executeProcedureAsync(
     }
 }
 
-async function initDbFirebird(params = [], res) {
+async function initDbFirebird(params = [], res, signal) {
     const dbName = params[0];
     const fbPool = getFirebirdPool(dbName);
 
@@ -280,19 +279,19 @@ async function initDbFirebird(params = [], res) {
             });
         });
 
-        if (res.aborted) {
+        if (signal.aborted) {
             db.detach();
             return;
         }
 
-        if (!res.aborted) {
+        if (!signal.aborted) {
             res.cork(() => {
                 res.writeHeader("Content-Type", "application/json");
             });
         }
 
         if (fbPool.isdev !== "Y") {
-            if (!res.aborted) {
+            if (!signal.aborted) {
                 res.cork(() => {
                     res.write(
                         JSON.stringify([
@@ -356,7 +355,7 @@ async function initDbFirebird(params = [], res) {
 
             db.detach();
 
-            if (!res.aborted) {
+            if (!signal.aborted) {
                 res.cork(() => {
                     res.write(
                         JSON.stringify(["SUCCESS"]) + "\n"
@@ -373,7 +372,7 @@ async function initDbFirebird(params = [], res) {
 
             db.detach();
 
-            if (!res.aborted) {
+            if (!signal.aborted) {
                 res.cork(() => {
                     res.write(
                         JSON.stringify([
@@ -395,7 +394,7 @@ async function initDbFirebird(params = [], res) {
 
         console.error("initDbFirebird error:", err);
 
-        if (!res.aborted) {
+        if (!signal.aborted) {
             res.cork(() => {
                 res.write(
                     JSON.stringify([

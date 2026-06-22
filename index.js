@@ -10,6 +10,7 @@ const socketsByUsername = new Map();
 const { activeResponses } = require("./connections");
 const MAX_BODY_SIZE = 1 * 1024 * 1024;  // 1MB
 const { decryptData } = require("./utils");
+//const cronService = require("./cronService");
 
 function readBody1(res) {
   return new Promise((resolve, reject) => {
@@ -30,9 +31,52 @@ function readBody(res, maxSize = 1 * 1024 * 1024) {
     let totalSize = 0;
 
     res.onData((chunk, isLast) => {
+      // 1. Hitung total size terlebih dahulu
       totalSize += chunk.byteLength;
 
       if (totalSize > maxSize) {
+        reject(new Error('Payload too large'));
+        return;
+      }
+
+      // 2. SOLUSI: Lakukan "Deep Copy" memori chunk agar tidak hilang
+      // Kita membuat Buffer baru dan menyalin isi chunk ke dalamnya
+      const bufferCopy = Buffer.allocUnsafe(chunk.byteLength);
+      Buffer.from(chunk).copy(bufferCopy);
+
+      chunks.push(bufferCopy);
+
+      // 3. Jika sudah chunk terakhir, gabungkan semua
+      if (isLast) {
+        resolve(Buffer.concat(chunks).toString());
+      }
+    });
+
+    // Catatan: Di uWS, disarankan juga untuk menghandle res.onAborted, sudah dihandle sebelumnya
+    //res.onAborted(() => {
+    //  console.log("aborted readbody")
+    //  reject(new Error('Request aborted'));
+    //});
+  });
+}
+
+function readBodyOld(res, maxSize = 1 * 1024 * 1024) {
+  return new Promise((resolve, reject) => {
+    let chunks = [];
+    let totalSize = 0;
+
+    res.onData((chunk, isLast) => {
+      console.log(
+        "chunk size:",
+        chunk.byteLength,
+        "isLast:",
+        isLast
+      );
+
+      totalSize += chunk.byteLength;
+
+      if (totalSize > maxSize) {
+        console.log('Payload too large')
         reject(new Error('Payload too large'));
         return;
       }
@@ -48,8 +92,8 @@ function readBody(res, maxSize = 1 * 1024 * 1024) {
 }
 
 // Fungsi kirim response JSON selalu OK, untuk error di dalam json
-function jsonRes(res, data) {
-  if (!res.aborted)
+function jsonRes(res, data, signal) {
+  if (!signal.aborted)
     res.cork(() => {
       res.writeStatus(`200 OK`);
       res.writeHeader("Content-Type", "application/json");
@@ -69,17 +113,24 @@ function getMimeType(filePath) {
 }
 
 function serveFile(res, filePath, contentType, encoding) {
+  let aborted = false;
+  res.onAborted(() => {
+    aborted = true;
+    console.log("Client aborted connection oe");
+  });
   fs.readFile(filePath, (err, data) => {
     if (err) {
-      res.cork(() => {
-        res.writeStatus("404 Not Found").end("Not found");
-      });
+      if (!aborted)
+        res.cork(() => {
+          res.writeStatus("404 Not Found").end("Not found");
+        });
     } else {
-      res.cork(() => {
-        res.writeHeader("Content-Type", contentType);
-        if (encoding) res.writeHeader("Content-Encoding", encoding);
-        res.end(data);
-      });
+      if (!aborted)
+        res.cork(() => {
+          res.writeHeader("Content-Type", contentType);
+          if (encoding) res.writeHeader("Content-Encoding", encoding);
+          res.end(data);
+        });
     }
   });
 }
@@ -136,18 +187,19 @@ uWS
   .post("/accurate/call/login", (res, req) => {
     const cookieHeader = req.getHeader("cookie") || "";
     let body = "";
+    const controller = new AbortController();
+    const { signal } = controller;
 
     // Handle abort connection
     res.onAborted(() => {
-      res.aborted = true;
-      console.log("Client aborted connection");
+      console.log("Client aborted connection > accurate > login");
+      controller.abort();
     });
 
     res.onData((chunk, isLast) => {
       body += Buffer.from(chunk).toString();
       if (body.length > MAX_BODY_SIZE) {
         res.writeStatus("413 Payload Too Large").end();
-        res.aborted = true;
         return;
       }
       if (isLast) {
@@ -161,7 +213,7 @@ uWS
           const json = JSON.parse(decryptedBody);
           callProcedurePg("accurate.login", [sessionId, json.username, json.password])
             .then((result) => {
-              if (!res.aborted)
+              if (!signal.aborted)
                 res.cork(() => {
                   res.writeHeader(
                     "Set-Cookie",
@@ -174,11 +226,11 @@ uWS
             .catch((err) => {
               // handle error
               console.error("Error call procedure 1:", err);
-              jsonRes(res, ["__ERROR__", err.message]);
+              jsonRes(res, ["__ERROR__", err.message], signal);
             });
         } catch (e) {
           console.error("Error call procedure 2:", e);
-          jsonRes(res, ["__ERROR__", e.message]);
+          jsonRes(res, ["__ERROR__", e.message], signal);
         }
       }
     });
@@ -187,10 +239,13 @@ uWS
     const cookieHeader = req.getHeader("cookie") || "";
     let buffer = Buffer.alloc(0);
 
+    const controller = new AbortController();
+    const { signal } = controller;
+
     // Handle abort connection
     res.onAborted(() => {
-      res.aborted = true;
-      console.log("Client aborted connection");
+      console.log("Client aborted connection > accurate > logout");
+      controller.abort();
     });
 
     res.onData((chunk, isLast) => {
@@ -198,16 +253,17 @@ uWS
       buffer = Buffer.concat([buffer, chunkBuffer]);
       if (buffer.length > MAX_BODY_SIZE) {
         res.writeStatus("413 Payload Too Large").end();
-        res.aborted = true;
+        signal.aborted = true;
         return;
       }
       if (isLast) {
-        if (res.aborted) return; // Kalau sudah abort, skip
+        if (signal.aborted) return; // Kalau sudah abort, skip
         const sessionId = cookieHeader.match(/appsaccurate_token=([^;]+)/)?.[1];
         if (!sessionId) {
           jsonRes(
             res,
-            ["__ERROR__", "Session expired / tidak ditemukan."]
+            ["__ERROR__", "Session expired / tidak ditemukan."],
+            signal
           );
           return;
         }
@@ -220,12 +276,12 @@ uWS
         try {
           body = JSON.parse(decryptedBody);
         } catch (err) {
-          jsonRes(res, ["__ERROR__", err.message]);
+          jsonRes(res, ["__ERROR__", err.message], signal);
           return;
         }
         const params = body.params || [];
         if (!params) {
-          jsonRes(res, ["__ERROR__", "Body : params tidak ditemukan."]);
+          jsonRes(res, ["__ERROR__", "Body : params tidak ditemukan."], signal);
           return;
         }
         params.unshift(sessionId);
@@ -243,7 +299,7 @@ uWS
           .catch((err) => {
             // handle error
             console.error("Error call procedure:", err);
-            jsonRes(res, ["__ERROR__", err.message]);
+            jsonRes(res, ["__ERROR__", err.message], signal);
           });
       }
     });
@@ -256,21 +312,20 @@ uWS
 
     // Handle abort connection
     res.onAborted(() => {
-      res.aborted = true;
+      console.log("Client aborted connection > accurate > verify_user");
       controller.abort();
-      console.log("Client aborted connection");
     });
 
     (async () => {
       try {
-        if (!res.aborted)
+        if (!signal.aborted)
           res.cork(() => {
             res.writeHeader("Content-Type", "application/x-ndjson");
           });
         const body = await readBody(res);
         const sessionId = cookieHeader.match(/appsaccurate_token=([^;]+)/)?.[1];
         if (!sessionId) {
-          if (!res.aborted)
+          if (!signal.aborted)
             res.cork(() => {
               res.write(JSON.stringify(["__ERROR__", "Session expired / tidak ditemukan."]));
             });
@@ -286,18 +341,18 @@ uWS
         const params = jsonbody.params || [];
         params.unshift(sessionId);
         // Header NDJSON harus dikirim segera
-        if (!res.aborted)
+        if (!signal.aborted)
           res.cork(() => {
             res.writeHeader("Content-Type", "application/x-ndjson");
           });
         await callProcedurePgNdjson("accurate.verify_user", params, res, signal);
       } catch (err) {
-        if (!res.aborted)
+        if (!signal.aborted)
           res.cork(() => {
             res.write(JSON.stringify(["__ERROR__", err.message]));
           });
       } finally {
-        if (!res.aborted)
+        if (!signal.aborted)
           res.cork(() => {
             res.end();
           });
@@ -312,12 +367,10 @@ uWS
     const controller = new AbortController();
     const { signal } = controller;
 
-
     // Handle abort connection
     res.onAborted(() => {
-      res.aborted = true;
+      console.log("Client aborted connection > accurate call");
       controller.abort();
-      console.log("Client aborted connection");
     });
 
     (async () => {
@@ -325,7 +378,7 @@ uWS
         const buffer = await readBody(res);
         const sessionId = cookieHeader.match(/appsaccurate_token=([^;]+)/)?.[1];
         if (!sessionId) {
-          if (!res.aborted)
+          if (!signal.aborted)
             res.cork(() => {
               res.write(JSON.stringify(["__ERROR__", "Session expired / tidak ditemukan."]));
             });
@@ -342,11 +395,11 @@ uWS
         const hasResult = String(body.hasResult ?? "false").toLowerCase() === "true";
         if (proc === "accurate.verify_actions" || proc === "accurate.verify_actions_confirm") { //execute procedur di firebird tapi di verifikasi dahulu di postgres
           const pPath = params.shift();
-          await callFbSp(proc, sessionId, pPath, params, hasResult, res);
+          await callFbSp(proc, sessionId, pPath, params, hasResult, res, signal);
         } else if (proc === "accurate.fbthenpg") {
           params.push(result[0][1][2]); // insertkan userid accurate
           const resFbThenPg = await FbThenPg(params);
-          if (!res.aborted)
+          if (!signal.aborted)
             res.cork(() => {
               res.write(JSON.stringify(resFbThenPg));
             });
@@ -355,15 +408,17 @@ uWS
           await callProcedurePgNdjson(proc, params, res, signal);
         }
       } catch (err) {
-        if (!res.aborted)
+        if (!signal.aborted)
           res.cork(() => {
             res.write(JSON.stringify(["__ERROR__", err.message]));
           });
       } finally {
-        if (!res.aborted)
+        //console.log(signal.aborted);
+        if (!signal.aborted) {
           res.cork(() => {
             res.end();
           });
+        }
       }
     })();
   })
