@@ -2,6 +2,7 @@ import Firebird from "node-firebird";
 import { getFirebirdPool } from "./dbFbPoolManager.js"
 import { callProcedurePg } from "./dbPg.js"
 import { loadAllDbConfigs } from "./configFb.js";
+import { pgPool } from "./configPg.js";
 
 function getDbAsync(fbPool) {
     return new Promise((resolve, reject) => {
@@ -137,6 +138,14 @@ export async function callFbSp(proc, sessionId, pPath, params, hasResult, res, s
                     await executeProcedureAsync(trx, fbSp, myParams, hasResult, res, signal);
                 } else if (result?.[0]?.[1]?.[0] === "initDbFirebird") {
                     await initDbFirebird(params, res, signal);
+                } else if (result?.[0]?.[1]?.[0] === "FbThenPg") {
+                    params.push(result[0][1][2]); // insertkan userid accurate
+                    const resFbThenPg = await FbThenPg(sessionId, pPath, params, signal);
+                    if (!signal.aborted)
+                        res.cork(() => {
+                            res.writeHeader("Content-Type", "application/json");
+                            res.write(JSON.stringify(resFbThenPg));
+                        });
                 } else {
                     if (!signal.aborted)
                         res.cork(() => {
@@ -407,47 +416,21 @@ async function initDbFirebird(params = [], res, signal) {
     }
 }
 
-export async function FbThenPg(params) {
+export async function FbThenPg(sessionid, pPath, params, signal) {
+    console.log(params);
+    const fbthenpg = params[1].split("|");
     const fbDbName = params[0];
-    let fbProcName = params[1];
-    const pgProcName = params[3];
-    const spparams = params.slice(4);
+    let fbProcName = fbthenpg[1];
+    const pgProcName = fbthenpg[2];
+    const spparams = params.slice(2);
+    console.log(spparams,"spparams");
     const fbPool = getFirebirdPool(fbDbName);
     let pgClient = null;
 
     return new Promise((resolve, reject) => {
         fbPool.get((err, db) => {
             if (err) return reject(new Error(`Koneksi FB Gagal: ${err.message}`));
-            fbConn = db;
-
-            if (fbPool.isdev === "Y")
-                isProcedureExists(fbConn, fbProcName, (err, exists) => {
-                    if (err) {
-                        fbConn.detach();
-                        return reject(new Error(`Cek FB Proc is exist gagal : ${err.message}`));
-                    }
-
-                    if (exists) {
-                        executeProcedure();
-                    } else {
-                        getDdlFromPostgres(fbProcName, (err, ddl, version) => {
-                            if (err) {
-                                fbConn.detach();
-                                return reject(new Error(`getDdlFromPostgres error : ${err.message}`));
-                            }
-                            createProcedure(fbConn, fbProcName, ddl, version, (err) => {
-                                if (err) {
-                                    fbConn.detach();
-                                    return reject(new Error(`Failed to create procedure: ${err.message}`));
-                                }
-
-                                executeProcedure();
-                            });
-                        });
-                    }
-                });
-            else
-                executeProcedure();
+            const fbConn = db;
 
             const transaction_options = {
                 isolation: Firebird.ISOLATION_READ_COMMITTED,
@@ -455,66 +438,67 @@ export async function FbThenPg(params) {
                 wait: false,
             };
 
-            function executeProcedure() {
-                fbConn.transaction(transaction_options, async (err, fbTx) => {
-                    if (err) {
-                        fbConn.detach();
-                        return reject(err);
+            fbConn.transaction(transaction_options, async (err, fbTx) => {
+                if (err) {
+                    fbConn.detach();
+                    return reject(err);
+                }
+
+                try {
+                    const sql = `SELECT * FROM ${fbProcName}(${spparams.map(() => '?').join(', ')})`;
+                    const fbResult = await new Promise((res, rej) => {
+                        fbTx.query(sql, spparams, (err, result) => {
+                            if (err) return rej(err);
+                            res(result ? result : null);
+                        });
+                    });
+
+                    if (!fbResult) {
+                        throw new Error('Data tidak ditemukan atau SP Firebird tidak mengembalikan hasil.');
                     }
+                    if (signal.aborted) {
+                        throw new Error('Request aborted.');
+                    }
+                    spparams.pop(); //keluarkan parameter iduser accurate
+                    spparams.push(JSON.stringify(fbResult));
+                    spparams.unshift(sessionid, pPath);
+                    pgClient = await pgPool.connect();
+                    await pgClient.query('BEGIN');
 
                     try {
-                        const sql = `SELECT * FROM ${fbProcName}(${spparams.map(() => '?').join(', ')})`;
-                        const fbResult = await new Promise((res, rej) => {
-                            fbTx.query(sql, spparams, (err, result) => {
-                                if (err) return rej(err);
-                                res(result ? result : null);
-                            });
+                        const pgSql = `SELECT * FROM "${params[0]}".${pgProcName}(${spparams.map((_, i) => `$${i + 1}`).join(', ')})`;
+                        const pgRes = await pgClient.query({ text: pgSql, values: spparams, rowMode: "array" });
+
+                        // 6. COMMIT PostgreSQL Terlebih Dahulu
+                        await pgClient.query('COMMIT');
+
+                        // 7. COMMIT Firebird (Hanya jika PG berhasil)
+                        await new Promise((res, rej) => {
+                            fbTx.commit((err) => (err ? rej(err) : res()));
                         });
 
-                        if (!fbResult) {
-                            throw new Error('Data tidak ditemukan atau SP Firebird tidak mengembalikan hasil.');
-                        }
-                        spparams.pop(); //keluarkan parameter iduser accurate
-                        spparams.push(JSON.stringify(fbResult));
-                        spparams.unshift(params[0], params[1], params[2]);
-                        pgClient = await pgPool.connect();
-                        await pgClient.query('BEGIN');
+                        //console.log('✅ Transaksi Berhasil di kedua sisi.');
+                        const header = pgRes.fields.map(f => f.name);
 
-                        try {
-                            const pgSql = `SELECT * FROM ${pgProcName}(${spparams.map((_, i) => `$${i + 1}`).join(', ')})`;
-                            const pgRes = await pgClient.query({ text: pgSql, values: spparams, rowMode: "array" });
+                        resolve({ header, rows: pgRes.rows });
 
-                            // 6. COMMIT PostgreSQL Terlebih Dahulu
-                            await pgClient.query('COMMIT');
-
-                            // 7. COMMIT Firebird (Hanya jika PG berhasil)
-                            await new Promise((res, rej) => {
-                                fbTx.commit((err) => (err ? rej(err) : res()));
-                            });
-
-                            //console.log('✅ Transaksi Berhasil di kedua sisi.');
-                            const header = pgRes.fields.map(f => f.name);
-
-                            resolve({ header, rows: pgRes.rows });
-
-                        } catch (pgError) {
-                            // Jika PG gagal, Rollback PG
-                            await pgClient.query('ROLLBACK');
-                            throw pgError;
-                        }
-
-                    } catch (error) {
-                        // 8. Jika terjadi error apapun (FB atau PG), Rollback Firebird
-                        fbTx.rollback();
-                        console.error('❌ Transaksi Dibatalkan:', error.message);
-                        reject(error);
-                    } finally {
-                        // 9. Kembalikan koneksi ke masing-masing Pool
-                        if (fbConn) fbConn.detach();
-                        if (pgClient) pgClient.release();
+                    } catch (pgError) {
+                        // Jika PG gagal, Rollback PG
+                        await pgClient.query('ROLLBACK');
+                        throw pgError;
                     }
-                });
-            }
+
+                } catch (error) {
+                    // 8. Jika terjadi error apapun (FB atau PG), Rollback Firebird
+                    fbTx.rollback();
+                    console.error('❌ Transaksi Dibatalkan:', error.message);
+                    reject(error);
+                } finally {
+                    // 9. Kembalikan koneksi ke masing-masing Pool
+                    if (fbConn) fbConn.detach();
+                    if (pgClient) pgClient.release();
+                }
+            });
         });
     });
 }

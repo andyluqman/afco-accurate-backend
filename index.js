@@ -396,14 +396,14 @@ uWS
         if (proc === "accurate.verify_actions" || proc === "accurate.verify_actions_confirm") { //execute procedur di firebird tapi di verifikasi dahulu di postgres
           const pPath = params.shift();
           await callFbSp(proc, sessionId, pPath, params, hasResult, res, signal);
-        } else if (proc === "accurate.fbthenpg") {
+        }/* else if (proc === "accurate.fbthenpg") {
           params.push(result[0][1][2]); // insertkan userid accurate
-          const resFbThenPg = await FbThenPg(params);
+          const resFbThenPg = await FbThenPg(sessionId, params, signal);
           if (!signal.aborted)
             res.cork(() => {
               res.write(JSON.stringify(resFbThenPg));
             });
-        } else {
+        }*/ else {
           params.unshift(sessionId);
           await callProcedurePgNdjson(proc, params, res, signal);
         }
