@@ -8,6 +8,9 @@ const isDev = process.env.NODE_ENV !== "production";
 const users = new Map();
 const socketsByUsername = new Map();
 const { activeResponses } = require("./connections");
+const { listen: listenPgNotify } = require("./pgListener");
+const { getTokensForUser, sendNotification } = require("./fcmService");
+const { sendWebhook } = require("./webhookService");
 const MAX_BODY_SIZE = 1 * 1024 * 1024;  // 1MB
 const { decryptData } = require("./utils");
 //const cronService = require("./cronService");
@@ -438,6 +441,50 @@ uWS
         .catch((err) => {
           console.error("Gagal memuat konfigurasi db fb :", err);
         });
+
+      // Mulai mendengarkan notifikasi PostgreSQL (LISTEN/NOTIFY)
+      listenPgNotify("new_realisasi", async (payload) => {
+        console.log("NOTIFY new_realisasi:", payload);
+
+        const userId = payload && payload.user_id;
+        if (!userId) {
+          console.warn("new_realisasi: payload tidak punya user_id, skip FCM");
+          return;
+        }
+
+        try {
+          //const tokens = await getTokensForUser(userId);
+          //if (tokens.length === 0) {
+          //  console.log(`new_realisasi: tidak ada FCM token untuk user ${userId}`);
+          //  return;
+          //}
+          const tokens = ["cxAiKfgrpeTvtjGcGb3m2Z:APA91bHxC9KQDelDC5--XfBM-bFCj1PZPtO24dutM1i1vp-pjFWpcs9eAxqTql3KWSYopuPRrrciS93BrTvj6n3BS0wQKkagMJlTWhQmUc9nevK3LobBapQ"]
+          const orderId = payload.order_id;
+          const result = await sendNotification({
+            tokens,
+            title: "Pesanan Baru",
+            body: `Ada pesanan baru${orderId ? ` #${orderId}` : ""}`,
+            data: {
+              user_id: String(userId),
+              order_id: orderId != null ? String(orderId) : "",
+              type: "new_order",
+            },
+          });
+          console.log("FCM terkirim:", result);
+
+          // Kirim juga ke webhook (mis. WhatsApp gateway)
+          const whResult = await sendWebhook({
+            clientId: "1",
+  number: "6289666293998",
+  text: "Halo dari Node.js"
+          });
+          console.log("Webhook terkirim:", whResult.status, whResult.body);
+        } catch (err) {
+          console.error("Gagal mengirim FCM untuk new_realisasi:", err);
+        }
+      }).catch((err) => {
+        console.error("Gagal memulai LISTEN new_realisasi:", err);
+      });
     } else {
       console.log("Failed to start server");
     }
@@ -455,5 +502,6 @@ process.on("SIGINT", () => {
     } catch { }
   }
 
-  process.exit(0);
+  const { closeAll } = require("./pgListener");
+  closeAll().catch(() => {}).finally(() => process.exit(0));
 });
