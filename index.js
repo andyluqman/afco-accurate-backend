@@ -443,45 +443,60 @@ uWS
         });
 
       // Mulai mendengarkan notifikasi PostgreSQL (LISTEN/NOTIFY)
-      listenPgNotify("new_realisasi", async (payload) => {
-        console.log("NOTIFY new_realisasi:", payload);
+      listenPgNotify("pg_notify", async (payload) => {
+        console.log("NOTIFY :", payload);
 
-        const userId = payload && payload.user_id;
+        const userId = payload && payload.jenis;
         if (!userId) {
-          console.warn("new_realisasi: payload tidak punya user_id, skip FCM");
+          console.warn("pg_notify: payload tidak punya jenis pesan.");
           return;
         }
 
-        try {
-          //const tokens = await getTokensForUser(userId);
-          //if (tokens.length === 0) {
-          //  console.log(`new_realisasi: tidak ada FCM token untuk user ${userId}`);
-          //  return;
-          //}
-          const tokens = ["cxAiKfgrpeTvtjGcGb3m2Z:APA91bHxC9KQDelDC5--XfBM-bFCj1PZPtO24dutM1i1vp-pjFWpcs9eAxqTql3KWSYopuPRrrciS93BrTvj6n3BS0wQKkagMJlTWhQmUc9nevK3LobBapQ"]
-          const orderId = payload.order_id;
-          const result = await sendNotification({
-            tokens,
-            title: "Pesanan Baru",
-            body: `Ada pesanan baru${orderId ? ` #${orderId}` : ""}`,
-            data: {
-              user_id: String(userId),
-              order_id: orderId != null ? String(orderId) : "",
-              type: "new_order",
-            },
-          });
-          console.log("FCM terkirim:", result);
+        if (payload.jenis === 'fcm') {
+          try {
+            //const tokens = await getTokensForUser(userId);
+            //if (tokens.length === 0) {
+            //  console.log(`new_realisasi: tidak ada FCM token untuk user ${userId}`);
+            //  return;
+            //}
+            const tokens = ["cxAiKfgrpeTvtjGcGb3m2Z:APA91bHxC9KQDelDC5--XfBM-bFCj1PZPtO24dutM1i1vp-pjFWpcs9eAxqTql3KWSYopuPRrrciS93BrTvj6n3BS0wQKkagMJlTWhQmUc9nevK3LobBapQ"]
+            const orderId = payload.order_id;
+            const result = await sendNotification({
+              tokens,
+              title: "Pesanan Baru",
+              body: `Ada pesanan baru${orderId ? ` #${orderId}` : ""}`,
+              data: {
+                user_id: String(userId),
+                order_id: orderId != null ? String(orderId) : "",
+                type: "new_order",
+              },
+            });
+            console.log("FCM terkirim:", result);
 
-          // Kirim juga ke webhook (mis. WhatsApp gateway)
-          const whResult = await sendWebhook({
-            clientId: "1",
-  number: "6289666293998",
-  text: "Halo dari Node.js"
-          });
-          console.log("Webhook terkirim:", whResult.status, whResult.body);
-        } catch (err) {
-          console.error("Gagal mengirim FCM untuk new_realisasi:", err);
+            // Kirim juga ke webhook (mis. WhatsApp gateway)
+            const whResult = await sendWebhook({
+              clientId: "1",
+              number: "6289666293998",
+              text: "Halo dari Node.js"
+            });
+            console.log("Webhook terkirim:", whResult.status, whResult.body);
+          } catch (err) {
+            console.error("Gagal mengirim notifikasi untuk new_realisasi:", err);
+          }
+        } else if (payload.jenis === 'whatapps') {
+          try {
+            // Kirim juga ke webhook (mis. WhatsApp gateway)
+            const whResult = await sendWebhook({
+              clientId: payload.clientId,
+              number: payload.number,
+              text: payload.text
+            });
+            console.log("Webhook terkirim:", whResult.status, whResult.body);
+          } catch (err) {
+            console.error("Gagal mengirim notifikasi untuk new_realisasi:", err);
+          }
         }
+
       }).catch((err) => {
         console.error("Gagal memulai LISTEN new_realisasi:", err);
       });
@@ -503,5 +518,5 @@ process.on("SIGINT", () => {
   }
 
   const { closeAll } = require("./pgListener");
-  closeAll().catch(() => {}).finally(() => process.exit(0));
+  closeAll().catch(() => { }).finally(() => process.exit(0));
 });
