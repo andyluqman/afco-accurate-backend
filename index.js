@@ -5,8 +5,8 @@ const { loadAllDbConfigs } = require("./configFb");
 const fs = require("fs");
 const path = require("path");
 const isDev = process.env.NODE_ENV !== "production";
-const users = new Map();
-const socketsByUsername = new Map();
+const clients = new Map();
+const wsToUser = new Map();
 const { activeResponses } = require("./connections");
 const { listen: listenPgNotify } = require("./pgListener");
 const { getTokensForUser, sendNotification } = require("./fcmService");
@@ -182,6 +182,13 @@ function handleStaticRequest(req, res, baseDir, routePrefix = "") {
       serveFile(res, filePath, mime);
     }
   }
+}
+
+function broadcast(data) {
+  const msg = JSON.stringify(data);
+  clients.forEach((ws) => {
+    ws.send(msg);
+  });
 }
 
 // UWS server
@@ -430,6 +437,57 @@ uWS
       console.warn("Request aborted by client");
     });
     handleStaticRequest(req, res, "dist", "/accurate/");
+  })
+  .ws("/accurate/ws", {
+    message: (ws, message) => {
+      try {
+        const data = JSON.parse(message);
+        if (data.type !== "presence") return;
+
+        if (data.action === "join") {
+          const username = data.username;
+          if (typeof username !== "string" || !username.trim()) return;
+
+          const trimmed = username.trim();
+
+          if (clients.has(trimmed)) {
+            const oldWs = clients.get(trimmed);
+            wsToUser.delete(oldWs);
+          }
+
+          const prevUsername = wsToUser.get(ws);
+          if (prevUsername) {
+            clients.delete(prevUsername);
+          }
+
+          clients.set(trimmed, ws);
+          wsToUser.set(ws, trimmed);
+
+          ws.send(JSON.stringify({ type: "presence", action: "init", users: Array.from(clients.keys()) }));
+          broadcast({ type: "presence", action: "joined", username: trimmed });
+        } else if (data.action === "leave") {
+          const username = data.username;
+          if (typeof username !== "string" || !username.trim()) return;
+
+          const trimmed = username.trim();
+          const actualUsername = wsToUser.get(ws);
+          if (actualUsername !== trimmed) return;
+
+          clients.delete(trimmed);
+          wsToUser.delete(ws);
+          broadcast({ type: "presence", action: "left", username: trimmed });
+        }
+      } catch (e) {
+      }
+    },
+    close: (ws) => {
+      const username = wsToUser.get(ws);
+      if (username) {
+        clients.delete(username);
+        wsToUser.delete(ws);
+        broadcast({ type: "presence", action: "left", username });
+      }
+    }
   })
   .listen(3030, (token) => {
     if (token) {

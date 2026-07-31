@@ -19,7 +19,7 @@ function initFirebase() {
   } else {
     credential = admin.credential.applicationDefault();
   }
-console.log(credential)
+//console.log(credential)
   admin.initializeApp({ credential });
   initialized = true;
 }
