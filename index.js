@@ -13,6 +13,7 @@ const { getTokensForUser, sendNotification } = require("./fcmService");
 const { sendWebhook } = require("./webhookService");
 const MAX_BODY_SIZE = 1 * 1024 * 1024;  // 1MB
 const { decryptData } = require("./utils");
+const Busboy = require("busboy");
 //const cronService = require("./cronService");
 
 function readBody1(res) {
@@ -185,6 +186,7 @@ function handleStaticRequest(req, res, baseDir, routePrefix = "") {
 }
 
 function broadcast(data) {
+  console.log(data,"bcast");
   const msg = JSON.stringify(data);
   clients.forEach((ws) => {
     ws.send(msg);
@@ -432,6 +434,173 @@ uWS
       }
     })();
   })
+  .post("/accurate/upload-bulk", (res, req) => {
+    const cookieHeader = req.getHeader("cookie") || "";
+    const sessionId = cookieHeader.match(/appsaccurate_token=([^;]+)/)?.[1];
+    const contentType = req.getHeader("content-type") || "";
+
+    if (!sessionId) {
+      res.cork(() => {
+        res.writeStatus("401 Unauthorized");
+        res.writeHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ success: false, message: "Session tidak ditemukan." }));
+      });
+      return;
+    }
+
+    if (!contentType.includes("multipart/form-data")) {
+      res.cork(() => {
+        res.writeStatus("400 Bad Request");
+        res.writeHeader("Content-Type", "application/json");
+        res.end(JSON.stringify({ success: false, message: "Content-Type harus multipart/form-data." }));
+      });
+      return;
+    }
+
+    const uploadedFiles = [];
+    let chunks = [];
+    let totalSize = 0;
+    const MAX_UPLOAD_SIZE = 50 * 1024 * 1024;
+
+    const controller = new AbortController();
+    const { signal } = controller;
+
+    res.onAborted(() => {
+      console.log("Koneksi upload-bulk dibatalkan oleh client");
+      controller.abort();
+    });
+
+    res.onData((chunk, isLast) => {
+      if (signal.aborted) return;
+
+      totalSize += chunk.byteLength;
+
+      if (totalSize > MAX_UPLOAD_SIZE) {
+        res.cork(() => {
+          res.writeStatus("413 Payload Too Large");
+          res.writeHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ success: false, message: "Ukuran upload melebihi batas maksimal (50MB)." }));
+        });
+        controller.abort();
+        return;
+      }
+
+      const bufferCopy = Buffer.allocUnsafe(chunk.byteLength);
+      Buffer.from(chunk).copy(bufferCopy);
+      chunks.push(bufferCopy);
+
+      if (isLast) {
+        (async () => {
+          try {
+            const sessionResult = await callProcedurePg("accurate.get_session", [sessionId]);
+
+            if (!sessionResult || !sessionResult[0] || sessionResult[0][1][1] !== "1") {
+              if (!signal.aborted) {
+                res.cork(() => {
+                  res.writeStatus("401 Unauthorized");
+                  res.writeHeader("Content-Type", "application/json");
+                  res.end(JSON.stringify({ success: false, message: "Session tidak valid." }));
+                });
+              }
+              return;
+            }
+
+            const busboy = Busboy({ headers: { "content-type": contentType } });
+            const fullBuffer = Buffer.concat(chunks);
+            const allowedTypes = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+            const MAX_FILES = 20;
+            let fileCount = 0;
+            let busboyFinished = false;
+            const pendingWrites = new Set();
+
+            const finishUpload = () => {
+              if (!signal.aborted && busboyFinished && pendingWrites.size === 0) {
+                res.cork(() => {
+                  res.writeHeader("Content-Type", "application/json");
+                  res.end(JSON.stringify({
+                    success: true,
+                    message: `${uploadedFiles.length} file berhasil diupload.`,
+                    files: uploadedFiles
+                  }));
+                });
+              }
+            };
+
+            busboy.on("file", (fieldname, fileStream, info) => {
+              const { filename, mimeType } = info;
+              console.log(`Menerima file: ${filename} (${mimeType})`);
+
+              fileCount++;
+
+              if (fileCount > MAX_FILES) {
+                fileStream.resume();
+                fileStream.on("end", () => {});
+                return;
+              }
+
+              if (!allowedTypes.includes(mimeType)) {
+                fileStream.resume();
+                fileStream.on("end", () => {});
+                return;
+              }
+
+              const ext = path.extname(filename).toLowerCase();
+              const baseName = path.basename(filename, ext);
+              const safeBase = baseName.replace(/[^a-zA-Z0-9_\-]/g, "_");
+              const timestamp = Date.now();
+              const newFilename = `${safeBase}_${timestamp}${ext}`;
+              const saveTo = path.join(__dirname, "uploads", newFilename);
+              const writeStream = fs.createWriteStream(saveTo);
+
+              pendingWrites.add(writeStream);
+              fileStream.pipe(writeStream);
+
+              writeStream.on("close", () => {
+                pendingWrites.delete(writeStream);
+                uploadedFiles.push(newFilename);
+                finishUpload();
+              });
+
+              writeStream.on("error", (err) => {
+                pendingWrites.delete(writeStream);
+                console.error("Error menyimpan file:", err);
+                finishUpload();
+              });
+            });
+
+            busboy.on("finish", () => {
+              busboyFinished = true;
+              finishUpload();
+            });
+
+            busboy.on("error", (err) => {
+              console.error("Busboy error:", err);
+              if (!signal.aborted) {
+                res.cork(() => {
+                  res.writeStatus("500 Internal Server Error");
+                  res.writeHeader("Content-Type", "application/json");
+                  res.end(JSON.stringify({ success: false, message: "Gagal memproses file." }));
+                });
+              }
+            });
+
+            busboy.write(fullBuffer);
+            busboy.end();
+
+          } catch (err) {
+            console.error("Gagal memproses bulk upload:", err);
+            if (!signal.aborted) {
+              res.cork(() => {
+                res.writeStatus("500 Internal Server Error");
+                res.writeHeader("Content-Type", "application/json");
+                res.end(JSON.stringify({ success: false, message: "Gagal memproses file." }));
+              });
+            }
+          }
+        })();
+      }
+    });
+  })
   .get("/*", (res, req) => {
     res.onAborted(() => {
       console.warn("Request aborted by client");
@@ -441,7 +610,8 @@ uWS
   .ws("/accurate/ws", {
     message: (ws, message) => {
       try {
-        const data = JSON.parse(message);
+        const text = Buffer.from(message).toString("utf8");
+        const data = JSON.parse(text);
         if (data.type !== "presence") return;
 
         if (data.action === "join") {
@@ -478,6 +648,7 @@ uWS
           broadcast({ type: "presence", action: "left", username: trimmed });
         }
       } catch (e) {
+        console.log("Error websocket on message : ", e);
       }
     },
     close: (ws) => {
