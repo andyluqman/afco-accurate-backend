@@ -601,6 +601,113 @@ uWS
       }
     });
   })
+  .get("/accurate/uploads/:filename", (res, req) => {
+    const cookieHeader = req.getHeader("cookie") || "";
+    const sessionId = cookieHeader.match(/appsaccurate_token=([^;]+)/)?.[1];
+    const filename = req.getParameter(0);
+
+    res.onAborted(() => {
+      console.log("Client aborted upload file request");
+    });
+
+    if (!sessionId) {
+      res.cork(() => {
+        res.writeStatus("401 Unauthorized").end("Session tidak ditemukan.");
+      });
+      return;
+    }
+
+    if (!filename || filename.includes("..") || filename.includes("/") || filename.includes("\\")) {
+      res.cork(() => {
+        res.writeStatus("400 Bad Request").end("Nama file tidak valid.");
+      });
+      return;
+    }
+
+    const filePath = path.join(__dirname, "uploads", filename);
+    const ext = path.extname(filename).toLowerCase();
+    const mimeMap = {
+      ".jpg": "image/jpeg",
+      ".jpeg": "image/jpeg",
+      ".png": "image/png",
+      ".gif": "image/gif",
+      ".webp": "image/webp",
+      ".svg": "image/svg+xml",
+      ".pdf": "application/pdf"
+    };
+    const contentType = mimeMap[ext] || "application/octet-stream";
+
+    fs.stat(filePath, (err, stats) => {
+      if (err || !stats.isFile()) {
+        const baseName = path.basename(filename, path.extname(filename));
+        const uploadsDir = path.join(__dirname, "uploads");
+
+        fs.readdir(uploadsDir, (err, files) => {
+          if (err) {
+            res.cork(() => {
+              res.writeStatus("500 Internal Server Error").end("Gagal membaca direktori uploads.");
+            });
+            return;
+          }
+
+          const matches = files.filter((f) => f.startsWith(baseName + "_") || f === filename);
+
+          if (matches.length === 0) {
+            res.cork(() => {
+              res.writeStatus("404 Not Found").end("File tidak ditemukan.");
+            });
+            return;
+          }
+
+          matches.sort((a, b) => b.localeCompare(a));
+          const latestFile = matches[0];
+          const lfp = path.join(uploadsDir, latestFile);
+          const ext = path.extname(latestFile).toLowerCase();
+          const mimeMap = {
+            ".jpg": "image/jpeg",
+            ".jpeg": "image/jpeg",
+            ".png": "image/png",
+            ".gif": "image/gif",
+            ".webp": "image/webp",
+            ".svg": "image/svg+xml",
+            ".pdf": "application/pdf"
+          };
+          const contentType = mimeMap[ext] || "application/octet-stream";
+
+          fs.readFile(lfp, (err, data) => {
+            if (err) {
+              res.cork(() => {
+                res.writeStatus("500 Internal Server Error").end("Gagal membaca file.");
+              });
+              return;
+            }
+
+            res.cork(() => {
+              res.writeHeader("Content-Type", contentType);
+              res.writeHeader("Cache-Control", "no-cache");
+              res.end(data);
+            });
+          });
+        });
+        return;
+      }
+
+      fs.readFile(filePath, (err, data) => {
+        if (err) {
+          res.cork(() => {
+            res.writeStatus("500 Internal Server Error").end("Gagal membaca file.");
+          });
+          return;
+        }
+
+        res.cork(() => {
+          res.writeHeader("Content-Type", contentType);
+          res.writeHeader("Cache-Control", "no-cache");
+          res.end(data);
+        });
+      });
+    });
+  })
   .get("/*", (res, req) => {
     res.onAborted(() => {
       console.warn("Request aborted by client");
