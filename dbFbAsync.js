@@ -140,12 +140,7 @@ export async function callFbSp(proc, sessionId, pPath, params, hasResult, res, s
                     await initDbFirebird(params, res, signal);
                 } else if (result?.[0]?.[1]?.[0] === "FbThenPg") {
                     params.push(result[0][1][2]); // insertkan userid accurate
-                    const resFbThenPg = await FbThenPg(sessionId, pPath, params, signal);
-                    if (!signal.aborted)
-                        res.cork(() => {
-                            res.writeHeader("Content-Type", "application/json");
-                            res.write(JSON.stringify(resFbThenPg));
-                        });
+                    await FbThenPg(sessionId, pPath, params, res, signal);
                 } else {
                     if (!signal.aborted)
                         res.cork(() => {
@@ -416,14 +411,14 @@ async function initDbFirebird(params = [], res, signal) {
     }
 }
 
-export async function FbThenPg(sessionid, pPath, params, signal) {
+export async function FbThenPg(sessionid, pPath, params, res, signal) {
     console.log(params);
     const fbthenpg = params[1].split("|");
     const fbDbName = params[0];
     let fbProcName = fbthenpg[1];
     const pgProcName = fbthenpg[2];
     const spparams = params.slice(2);
-    console.log(spparams,"spparams");
+    //console.log(spparams, "spparams");
     const fbPool = getFirebirdPool(fbDbName);
     let pgClient = null;
 
@@ -469,32 +464,111 @@ export async function FbThenPg(sessionid, pPath, params, signal) {
                         const pgSql = `SELECT * FROM "${params[0]}".${pgProcName}(${spparams.map((_, i) => `$${i + 1}`).join(', ')})`;
                         const pgRes = await pgClient.query({ text: pgSql, values: spparams, rowMode: "array" });
 
-                        // 6. COMMIT PostgreSQL Terlebih Dahulu
+                        if (!signal.aborted) {
+                            res.cork(() => {
+                                res.writeHeader("Content-Type", "application/x-ndjson");
+                            });
+                        }
+
+                        const mainHeaders = pgRes.fields.map(f => f.name);
+                        let outvar = [];
+                        let outvarheadernoportal = [];
+                        let cursorNames = [];
+
+                        if (pgRes.rows.length > 0) {
+                            for (let i = 0; i < pgRes.rows[0].length; i++) {
+                                let value = pgRes.rows[0][i];
+                                if (typeof value !== 'string' || !value.includes('unnamed portal')) {
+                                    outvar.push(value);
+                                    outvarheadernoportal.push(mainHeaders[i]);
+                                } else {
+                                    cursorNames.push(value);
+                                }
+                            }
+                        }
+
+                        function writeNdjsonRow(data) {
+                            if (signal.aborted) return;
+                            try {
+                                res.cork(() => {
+                                    res.write(JSON.stringify(data) + "\n");
+                                });
+                            } catch (_) {}
+                        }
+
+                        if (outvarheadernoportal.length > 0) {
+                            writeNdjsonRow(["__BEGIN_SET__", "PG", "OUTVAR"]);
+                            writeNdjsonRow(["__HEADER__", ...outvarheadernoportal]);
+                            writeNdjsonRow(outvar);
+                            writeNdjsonRow(["__END_SET__"]);
+                        }
+
+                        for (const cursorName of cursorNames) {
+                            const batchSize = 1000;
+                            let hasMore = true;
+                            let isHeaderSent = false;
+                            let currentCursorHeaders = null;
+
+                            while (hasMore) {
+                                if (signal.aborted) {
+                                    await pgClient.query('ROLLBACK');
+                                    return;
+                                }
+
+                                const cursorRes = await pgClient.query({
+                                    text: `FETCH ${batchSize} FROM "${cursorName}"`,
+                                    rowMode: "array"
+                                });
+
+                                if (!isHeaderSent) {
+                                    currentCursorHeaders = cursorRes.fields.map(f => f.name);
+                                    writeNdjsonRow(["__BEGIN_SET__", "PG", cursorName]);
+                                    writeNdjsonRow(["__HEADER__", ...currentCursorHeaders]);
+                                    isHeaderSent = true;
+                                }
+
+                                if (cursorRes.rows.length === 0) {
+                                    hasMore = false;
+                                } else {
+                                    for (const row of cursorRes.rows) {
+                                        if (signal.aborted) {
+                                            await pgClient.query('ROLLBACK');
+                                            return;
+                                        }
+                                        writeNdjsonRow(row);
+                                    }
+                                    if (cursorRes.rows.length < batchSize) {
+                                        hasMore = false;
+                                    }
+                                }
+                            }
+                            writeNdjsonRow(["__END_SET__"]);
+
+                            try {
+                                await pgClient.query(`CLOSE "${cursorName}"`);
+                            } catch (e) {
+                                if (e.code !== '34000') throw e;
+                            }
+                        }
+
                         await pgClient.query('COMMIT');
 
-                        // 7. COMMIT Firebird (Hanya jika PG berhasil)
                         await new Promise((res, rej) => {
                             fbTx.commit((err) => (err ? rej(err) : res()));
                         });
 
-                        //console.log('✅ Transaksi Berhasil di kedua sisi.');
-                        const header = pgRes.fields.map(f => f.name);
-
-                        resolve({ header, rows: pgRes.rows });
+                        resolve();
 
                     } catch (pgError) {
-                        // Jika PG gagal, Rollback PG
                         await pgClient.query('ROLLBACK');
                         throw pgError;
                     }
 
                 } catch (error) {
-                    // 8. Jika terjadi error apapun (FB atau PG), Rollback Firebird
                     fbTx.rollback();
                     console.error('❌ Transaksi Dibatalkan:', error.message);
                     reject(error);
                 } finally {
-                    // 9. Kembalikan koneksi ke masing-masing Pool
                     if (fbConn) fbConn.detach();
                     if (pgClient) pgClient.release();
                 }
