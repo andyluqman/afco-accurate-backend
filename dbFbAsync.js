@@ -136,8 +136,10 @@ export async function callFbSp(proc, sessionId, pPath, params, hasResult, res, s
                     const fbSp = myParams.shift(); //ambil dan hapus param nama store procedure
                     myParams.push(result[0][1][2]); // insertkan userid accurate
                     await executeProcedureAsync(trx, fbSp, myParams, hasResult, res, signal);
-                } else if (result?.[0]?.[1]?.[0] === "initDbFirebird") {
+                } else if (result?.[0]?.[1]?.[0] === "initdbfirebird") {
                     await initDbFirebird(params, res, signal);
+                } else if (result?.[0]?.[1]?.[0] === "syncdbfirebird") {
+                    await syncDbFirebird(params, res, signal);
                 } else if (result?.[0]?.[1]?.[0] === "FbThenPg") {
                     params.push(result[0][1][2]); // insertkan userid accurate
                     await FbThenPg(sessionId, pPath, params, res, signal);
@@ -159,7 +161,7 @@ export async function callFbSp(proc, sessionId, pPath, params, hasResult, res, s
             } catch (_) { }
         }
 
-        throw new Error(`CallSp -> ${err.message}`, {
+        throw new Error(`${err.message} [CallFbSp]`, {
             cause: err
         });
     } finally {
@@ -575,4 +577,147 @@ export async function FbThenPg(sessionid, pPath, params, res, signal) {
             });
         });
     });
+}
+
+async function syncDbFirebird(params = [], res, signal) {
+    const dbName = params[0];
+    const fbPool = getFirebirdPool(dbName);
+
+    let db;
+
+    try {
+        // promisify fbPool.get
+        db = await new Promise((resolve, reject) => {
+            fbPool.get((err, connection) => {
+                if (err) return reject(err);
+                resolve(connection);
+            });
+        });
+
+        if (signal.aborted) {
+            db.detach();
+            return;
+        }
+
+        if (!signal.aborted) {
+            res.cork(() => {
+                res.writeHeader("Content-Type", "application/json");
+            });
+        }
+
+        if (fbPool.isdev !== "Y") {
+            if (!signal.aborted) {
+                res.cork(() => {
+                    res.write(
+                        JSON.stringify([
+                            "__ERROR__",
+                            "Status database bukan development"
+                        ]) + "\n"
+                    );
+                });
+            }
+
+            db.detach();
+            return;
+        }
+
+        // ambil ddl
+        const result = await callProcedurePg(
+            'accurate.getDdl',
+            ['6def3da0-ec48-4c49-8f40-be96201367f4', '/ddl-compare', params[3], params[4], params[5]]
+        );
+
+        const ddlList = result[0].slice(1).map(row => row[0]);
+
+        // promisify transaction
+        const transaction = await new Promise((resolve, reject) => {
+            db.transaction((err, trx) => {
+                if (err) return reject(err);
+                resolve(trx);
+            });
+        });
+
+        try {
+
+            // execute semua ddl satu per satu
+            for (let i = 0; i < ddlList.length; i++) {
+                const sql = ddlList[i];
+
+                await new Promise((resolve, reject) => {
+                    transaction.query(sql, (err) => {
+                        if (err) {
+                            console.error("DDL error:", sql, err);
+
+                            return reject(
+                                new Error(
+                                    `DDL failed at index ${i}: ${err.message}`
+                                )
+                            );
+                        }
+
+                        resolve();
+                    });
+                });
+            }
+
+            // commit
+            await new Promise((resolve, reject) => {
+                transaction.commit((err) => {
+                    if (err) return reject(err);
+                    resolve();
+                });
+            });
+
+            db.detach();
+
+            if (!signal.aborted) {
+                res.cork(() => {
+                    res.write(
+                        JSON.stringify(["SUCCESS"]) + "\n"
+                    );
+                });
+            }
+
+        } catch (err) {
+
+            // rollback kalau ada error
+            await new Promise((resolve) => {
+                transaction.rollback(() => resolve());
+            });
+
+            db.detach();
+
+            if (!signal.aborted) {
+                res.cork(() => {
+                    res.write(
+                        JSON.stringify([
+                            "__ERROR__",
+                            err.message
+                        ]) + "\n"
+                    );
+                });
+            }
+        }
+
+    } catch (err) {
+
+        if (db) {
+            try {
+                db.detach();
+            } catch { }
+        }
+
+        console.error("initDbFirebird error:", err);
+
+        if (!signal.aborted) {
+            res.cork(() => {
+                res.write(
+                    JSON.stringify([
+                        "__ERROR__",
+                        err.message || "Unknown error"
+                    ]) + "\n"
+                );
+            });
+        }
+    }
 }

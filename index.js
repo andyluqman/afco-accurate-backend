@@ -223,7 +223,7 @@ uWS
           const day = String(now.getDate()).padStart(2, "0");
           decryptedBody = decryptData(body, year + day + day + month + year + month);
           const json = JSON.parse(decryptedBody);
-          callProcedurePg("accurate.login", [sessionId, json.username, json.password])
+          callProcedurePg("accurate.login", [sessionId, json.username, json.password, json.deviceId])
             .then((result) => {
               if (!signal.aborted)
                 res.cork(() => {
@@ -232,7 +232,7 @@ uWS
                     `appsaccurate_token=${result[0][1][0]}; HttpOnly; Secure; Path=/; SameSite=Strict`
                   );
                   res.writeHeader("Content-Type", "application/json");
-                  res.end(JSON.stringify(["success", result[0][1][1], result[0][1][2]]));
+                  res.end(JSON.stringify(["success", result[0][1][1], result[0][1][2], result[0][1][3]]));
                 });
             })
             .catch((err) => {
@@ -513,8 +513,19 @@ uWS
             let busboyFinished = false;
             const pendingWrites = new Set();
 
-            const finishUpload = () => {
+            const finishUpload = async () => {
               if (!signal.aborted && busboyFinished && pendingWrites.size === 0) {
+                // Simpan ke PostgreSQL via stored procedure (bulk)
+                if (uploadedFiles.length > 0) {
+                  try {
+                    const filenames = uploadedFiles.map(f => f.filename);
+                    const idests = uploadedFiles.map(f => f.idest);
+                    await callProcedurePg("accurate.upload_bulk_save", [sessionId, filenames, idests]);
+                    console.log(`${uploadedFiles.length} file records saved to PostgreSQL`);
+                  } catch (dbErr) {
+                    console.error("Gagal menyimpan ke PostgreSQL:", dbErr);
+                  }
+                }
                 res.cork(() => {
                   res.writeHeader("Content-Type", "application/json");
                   res.end(JSON.stringify({
@@ -557,7 +568,7 @@ uWS
 
               writeStream.on("close", () => {
                 pendingWrites.delete(writeStream);
-                uploadedFiles.push(newFilename);
+                uploadedFiles.push({ filename: newFilename, idest: safeBase });
                 finishUpload();
               });
 
