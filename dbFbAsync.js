@@ -622,11 +622,18 @@ async function syncDbFirebird(params = [], res, signal) {
         }
 
         // ambil ddl
-        const result = await callProcedurePg(
-            'accurate.getDdl',
-            ['6def3da0-ec48-4c49-8f40-be96201367f4', '/ddl-compare', params[3], params[4], params[5]]
-        );
-
+        let result;
+        if (params[6]) {
+            result = await callProcedurePg(
+                'accurate.getDdl_cursor',
+                ['6def3da0-ec48-4c49-8f40-be96201367f4', '/ddl-compare', params[3], params[4], params[5], params[6]]
+            );
+        } else {
+            result = await callProcedurePg(
+                'accurate.getDdl_cursor',
+                ['6def3da0-ec48-4c49-8f40-be96201367f4', '/ddl-compare', params[3], params[4], params[5]]
+            );
+        }
         const ddlList = result[0].slice(1).map(row => row[0]);
 
         // promisify transaction
