@@ -13,12 +13,16 @@ function getDbAsync(fbPool) {
     });
 }
 
-function getTrxAsync(db) {
-    const transaction_options = {
-        isolation: Firebird.ISOLATION_READ_COMMITTED,
-        readOnly: false,
-        wait: false,
-    };
+function getTrxAsync(db, cekEdit = true) {
+    const transaction_options = cekEdit
+        ? {
+              isolation: Firebird.ISOLATION_READ_COMMITTED,
+              readOnly: false,
+              wait: false,
+          }
+        : {
+              isolation: Firebird.ISOLATION_READ_UNCOMMITTED,
+          };
     return new Promise((resolve, reject) => {
         db.transaction(
             transaction_options,
@@ -51,7 +55,7 @@ function rollbackAsync(trx) {
     });
 }
 
-export async function callFbSp(proc, sessionId, pPath, params, hasResult, res, signal) {
+export async function callFbSp(proc, sessionId, pPath, params, hasResult, res, signal, cekEdit = true) {
     let dbName;
     const is2D = Array.isArray(params[0]) && params.every(p => Array.isArray(p));
     const params2D = is2D ? params : [params];
@@ -98,7 +102,7 @@ export async function callFbSp(proc, sessionId, pPath, params, hasResult, res, s
     let trx;
     try {
         db = await getDbAsync(fbPool);
-        trx = await getTrxAsync(db);
+        trx = await getTrxAsync(db, cekEdit);
         let isWriteHeader = false;
         for (let idx = 0; idx < params2D.length; idx++) {
             const myParams = params2D[idx];
@@ -142,7 +146,7 @@ export async function callFbSp(proc, sessionId, pPath, params, hasResult, res, s
                     await syncDbFirebird(params, res, signal);
                 } else if (result?.[0]?.[1]?.[0] === "FbThenPg") {
                     params.push(result[0][1][2]); // insertkan userid accurate
-                    await FbThenPg(sessionId, pPath, params, res, signal);
+                    await FbThenPg(sessionId, pPath, params, res, signal, cekEdit);
                 } else {
                     if (!signal.aborted)
                         res.cork(() => {
@@ -182,7 +186,7 @@ async function executeProcedureAsync(
     if (signal.aborted) return;
 
     if (!/^[A-Z0-9_]+$/i.test(procName)) {
-        throw new Error(`ExecuteProcedureAsync -> Invalid procedure name : ${procName}`);
+        throw new Error(`Invalid procedure name : ${procName} [ExecuteProcedureAsync]`);
     }
 
     function safeWrite(data) {
@@ -266,7 +270,7 @@ async function executeProcedureAsync(
 
         safeWrite(JSON.stringify(["__END_SET__"]) + "\n");
     } catch (err) {
-        throw new Error(`ExecuteProcedureAsync -> ${err.message}`);
+        throw new Error(`${err.message} [ExecuteProcedureAsync]`);
     }
 }
 
@@ -413,8 +417,7 @@ async function initDbFirebird(params = [], res, signal) {
     }
 }
 
-export async function FbThenPg(sessionid, pPath, params, res, signal) {
-    console.log(params);
+export async function FbThenPg(sessionid, pPath, params, res, signal, cekEdit = true) {
     const fbthenpg = params[1].split("|");
     const fbDbName = params[0];
     let fbProcName = fbthenpg[1];
@@ -429,11 +432,17 @@ export async function FbThenPg(sessionid, pPath, params, res, signal) {
             if (err) return reject(new Error(`Koneksi FB Gagal: ${err.message}`));
             const fbConn = db;
 
-            const transaction_options = {
-                isolation: Firebird.ISOLATION_READ_COMMITTED,
-                readOnly: false,
-                wait: false,
-            };
+            const transaction_options = cekEdit
+                ? {
+                      isolation: Firebird.ISOLATION_READ_COMMITTED,
+                      readOnly: false,
+                      wait: false,
+                  }
+                : {
+                      isolation: Firebird.ISOLATION_READ_UNCOMMITTED,
+                      readOnly: true,
+                      wait: false,
+                  };
 
             fbConn.transaction(transaction_options, async (err, fbTx) => {
                 if (err) {
@@ -445,7 +454,19 @@ export async function FbThenPg(sessionid, pPath, params, res, signal) {
                     const sql = `SELECT * FROM ${fbProcName}(${spparams.map(() => '?').join(', ')})`;
                     const fbResult = await new Promise((res, rej) => {
                         fbTx.query(sql, spparams, (err, result) => {
-                            if (err) return rej(err);
+                            if (err) {
+                                const isLockError = err.message && (
+                                    err.message.includes("335544508") ||
+                                    err.message.includes("335544336") ||
+                                    err.message.toLowerCase().includes("lock") ||
+                                    err.message.toLowerCase().includes("deadlock") ||
+                                    err.message.toLowerCase().includes("update conflict")
+                                );
+                                if (isLockError) {
+                                    return rej(new Error("Data sedang diedit user lain, silakan coba lagi nanti"));
+                                }
+                                return rej(err);
+                            }
                             res(result ? result : null);
                         });
                     });

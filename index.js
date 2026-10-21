@@ -405,9 +405,10 @@ uWS
         const body = JSON.parse(raw);
         const params = body.params || [];
         const hasResult = String(body.hasResult ?? "false").toLowerCase() === "true";
+        const cekEdit = body.cekEdit !== undefined ? String(body.cekEdit).toLowerCase() === "true" : true;
         if (proc === "accurate.verify_actions" || proc === "accurate.verify_actions_confirm") { //execute procedur di firebird tapi di verifikasi dahulu di postgres
           const pPath = params.shift();
-          await callFbSp(proc, sessionId, pPath, params, hasResult, res, signal);
+          await callFbSp(proc, sessionId, pPath, params, hasResult, res, signal, cekEdit);
         }/* else if (proc === "accurate.fbthenpg") {
           params.push(result[0][1][2]); // insertkan userid accurate
           const resFbThenPg = await FbThenPg(sessionId, params, signal);
