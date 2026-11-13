@@ -32,7 +32,7 @@ const minioClient = isMinioEnabled
   : null;
 
 let bucketReady = null;
-const ALLOWED_FOLDERS = ["upload", "uploads", "foto", "karyawan", "pindah-barang", "dokumen", "ttd", "berkas", "gambar","terima_pb"];
+const ALLOWED_FOLDERS = ["uploads","TOKO 27042026/karyawan","TOKO 27042026/terima_pb","TOKO/karyawan","TOKO/terima_pb"];
 
 function ensureBucket() {
   if (!isMinioEnabled) return Promise.resolve(false);
@@ -60,14 +60,17 @@ function normalizeFolder(folder) {
   if (f.includes("..") || f.startsWith("/") || f.includes("://")) return "";
   const clean = f.split("/").filter(Boolean).join("/");
   if (!clean) return "";
-  if (!/^[a-zA-Z0-9/_-]+$/.test(clean)) return "";
-  // Only allow first level folder or predefined paths
+  if (!/^[a-zA-Z0-9/_\- ]+$/.test(clean)) return "";
+  // Check if the full normalized folder is in the whitelist
+  // (whitelist entries may contain spaces and slashes, e.g. "TOKO 27042026/karyawan")
+  const lowerClean = clean.toLowerCase();
+  for (const allowed of ALLOWED_FOLDERS) {
+    if (allowed.toLowerCase() === lowerClean) return clean;
+  }
+  // Also check first segment only (for subfolders like "TOKO 27042026/karyawan/foo")
   const first = clean.split("/")[0].toLowerCase();
-  if (ALLOWED_FOLDERS.includes(first)) {
-    // normalize to lowercase for first level
-    const parts = clean.split("/");
-    parts[0] = first;
-    return parts.join("/");
+  for (const allowed of ALLOWED_FOLDERS) {
+    if (allowed.toLowerCase().split("/")[0] === first) return clean;
   }
   return "";
 }

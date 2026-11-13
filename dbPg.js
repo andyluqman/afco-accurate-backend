@@ -62,32 +62,51 @@ async function callProcedurePgNdjson(rawProcName, params, res, signal) {
       return;
     }
 
-    const firstRow = mainRes.rows[0];
     const mainHeaders = mainRes.fields.map(f => f.name);
 
-    let outvar = [];
-    let outvarheadernoportal = [];
-    let cursorNames = [];
+    let cursorIndexes = [];
+    let outvarIndexes = [];
+
+    const firstRow = mainRes.rows[0];
 
     if (firstRow) {
       for (let i = 0; i < firstRow.length; i++) {
-        let value = firstRow[i];
-        if (typeof value === 'string' && value.includes('unnamed portal')) {
-          cursorNames.push(value);
+        const value = firstRow[i];
+
+        if (
+          typeof value === 'string' &&
+          value.includes('unnamed portal')
+        ) {
+          cursorIndexes.push(i);
         } else {
-          outvar.push(value);
-          outvarheadernoportal.push(mainHeaders[i]);
+          outvarIndexes.push(i);
         }
       }
     }
 
+    const cursorNames = cursorIndexes.map(i => firstRow[i]);
+
+    const outvarheadernoportal =
+      outvarIndexes.map(i => mainHeaders[i]);
+
+    // Ambil semua rows, bukan hanya firstRow
+    const outvarRows = mainRes.rows.map(row =>
+      outvarIndexes.map(i => row[i])
+    );
+
     // --- 1. Streaming data non-cursor (Output Variables) ---
     if (outvarheadernoportal.length > 0) {
-      //if(!aborted) writeNdjsonRow(res, outvarheadernoportal);
-      writeNdjsonRow(res, ["__BEGIN_SET__", "PG", 'OUTVAR']);
-      writeNdjsonRow(res, ["__HEADER__", ...outvarheadernoportal]);
-      writeNdjsonRow(res, outvar);
-      // Penanda akhir untuk Output Variables Set
+      writeNdjsonRow(res, ["__BEGIN_SET__", "PG", "OUTVAR"]);
+
+      writeNdjsonRow(res, [
+        "__HEADER__",
+        ...outvarheadernoportal
+      ]);
+
+      for (const row of outvarRows) {
+        writeNdjsonRow(res, row);
+      }
+
       writeNdjsonRow(res, ["__END_SET__"]);
     }
 

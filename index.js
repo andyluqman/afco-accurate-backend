@@ -188,7 +188,7 @@ function handleStaticRequest(req, res, baseDir, routePrefix = "") {
 }
 
 function broadcast(data) {
-  console.log(data,"bcast");
+  console.log(data, "bcast");
   const msg = JSON.stringify(data);
   clients.forEach((ws) => {
     ws.send(msg);
@@ -226,7 +226,7 @@ async function resolveUploadObject(filename, folder = "") {
 }
 
 // Helper: parse nmfile yang tersimpan di DB.
-  // nmfile bisa berupa:
+// nmfile bisa berupa:
 // - "pindah-barang/4063_123.jpg" (relative path, sudah termasuk folder)
 // - "4063_123.jpg"                (hanya filename, folder diambil dari parameter/request)
 
@@ -584,132 +584,173 @@ uWS
               return;
             }
 
-              const busboy = Busboy({ headers: { "content-type": contentType } });
-              const fullBuffer = Buffer.concat(chunks);
-              const allowedTypes = ["image/jpeg", "image/png", "image/gif", "image/webp"];
-              const MAX_FILES = 20;
-              let fileCount = 0;
-              let busboyFinished = false;
-              let pendingUploads = 0;
-              const uploadErrors = [];
-              let uploadFolder = "";
+            const busboy = Busboy({ headers: { "content-type": contentType } });
+            const fullBuffer = Buffer.concat(chunks);
+            const allowedTypes = ["image/jpeg", "image/png", "image/gif", "image/webp"];
+            const MAX_FILES = 20;
+            let fileCount = 0;
+            let busboyFinished = false;
+            let pendingUploads = 0;
+            const uploadErrors = [];
+            let uploadFolder = "";
+            let uploadOptsRows = [];
+            let fileIndex = 0;
 
-              busboy.on("field", (fieldname, val) => {
-                if (fieldname === "folder" || fieldname === "path" || fieldname === "type" || fieldname === "module" || fieldname === "dir") {
-                  const norm = storage.normalizeFolder ? storage.normalizeFolder(val) : "";
-                  if (norm) uploadFolder = norm;
-                }
+            busboy.on("field", (fieldname, val) => {
+              if (fieldname === "folder" || fieldname === "path" || fieldname === "type" || fieldname === "module" || fieldname === "dir") {
+                const norm = storage.normalizeFolder ? storage.normalizeFolder(val) : "";
+                if (norm) uploadFolder = norm;
+              }
+              if (fieldname === "opts") {
+                uploadOptsRows = JSON.parse(val);
+              }
+            });
+
+            busboy.on("file", (fieldname, fileStream, info) => {
+              const { filename, mimeType } = info;
+              console.log(`Menerima file: ${filename} (${mimeType})`);
+
+              const currentIndex = fileIndex++;
+
+              const fileOpts = uploadOptsRows[currentIndex] || [];
+
+              fileCount++;
+              if (fileCount > MAX_FILES) {
+                fileStream.resume();
+                return;
+              }
+
+              if (!allowedTypes.includes(mimeType)) {
+                fileStream.resume();
+                uploadErrors.push(`Tipe file tidak diizinkan: ${filename} (${mimeType})`);
+                return;
+              }
+
+              const ext = path.extname(filename).toLowerCase();
+              const baseName = path.basename(filename, ext);
+              const safeBase = baseName.replace(/[^a-zA-Z0-9_\-]/g, "_");
+              const timestamp = Date.now();
+              const newFilename = `${safeBase}_${timestamp}${ext}`;
+
+              const parts = [];
+              pendingUploads++;
+              fileStream.on("data", (data) => parts.push(data));
+              fileStream.on("error", (err) => {
+                pendingUploads--;
+                uploadErrors.push(`Gagal membaca file ${filename}: ${err.message}`);
               });
-
-              busboy.on("file", (fieldname, fileStream, info) => {
-                const { filename, mimeType } = info;
-                console.log(`Menerima file: ${filename} (${mimeType})`);
-
-                fileCount++;
-                if (fileCount > MAX_FILES) {
-                  fileStream.resume();
-                  return;
-                }
-
-                if (!allowedTypes.includes(mimeType)) {
-                  fileStream.resume();
-                  uploadErrors.push(`Tipe file tidak diizinkan: ${filename} (${mimeType})`);
-                  return;
-                }
-
-                const ext = path.extname(filename).toLowerCase();
-                const baseName = path.basename(filename, ext);
-                const safeBase = baseName.replace(/[^a-zA-Z0-9_\-]/g, "_");
-                const timestamp = Date.now();
-                const newFilename = `${safeBase}_${timestamp}${ext}`;
-
-                const parts = [];
-                pendingUploads++;
-                fileStream.on("data", (data) => parts.push(data));
-                fileStream.on("error", (err) => {
-                  pendingUploads--;
-                  uploadErrors.push(`Gagal membaca file ${filename}: ${err.message}`);
-                });
-                fileStream.on("end", async () => {
-                  try {
-                    const buffer = Buffer.concat(parts);
-                    const saved = await storage.putFile(newFilename, buffer, mimeType, uploadFolder);
-                    uploadedFiles.push({
-                      filename: newFilename,
-                      relative: saved.relative,
-                      folder: saved.folder || "",
-                      idest: safeBase,
-                      size: saved.size,
-                      storage: saved.storage
-                    });
-                    console.log(`File ${newFilename} disimpan ke ${saved.storage}${saved.folder ? `/${saved.folder}` : ""}`);
-                  } catch (err) {
-                    console.error("Gagal menyimpan file:", err);
-                    uploadErrors.push(`Gagal menyimpan file ${newFilename}: ${err.message}`);
-                  } finally {
-                    pendingUploads--;
-                    finishUpload();
-                  }
-                });
-              });
-
-              const finishUpload = async () => {
-                if (!busboyFinished || pendingUploads !== 0 || signal.aborted) return;
-
-                // Simpan ke PostgreSQL via stored procedure (bulk)
-                if (uploadedFiles.length > 0) {
-                  try {
-                    // Kirim path relatif MinIO (mis. foto/123_456.jpg atau 123_456.jpg) ke nmfile
-                    const filenames = uploadedFiles.map(f => f.relative || f.filename);
-                    const idests = uploadedFiles.map(f => f.idest);
-                    await callProcedurePg("accurate.upload_bulk_save", [sessionId, filenames, idests]);
-                    console.log(`${uploadedFiles.length} file records saved to PostgreSQL`);
-                  } catch (dbErr) {
-                    console.error("Gagal menyimpan ke PostgreSQL:", dbErr);
-                  }
-                }
-                if (uploadedFiles.length === 0 && uploadErrors.length > 0) {
-                  res.cork(() => {
-                    res.writeStatus("500 Internal Server Error");
-                    res.writeHeader("Content-Type", "application/json");
-                    res.end(JSON.stringify({
-                      success: false,
-                      message: uploadErrors[0],
-                      errors: uploadErrors
-                    }));
+              fileStream.on("end", async () => {
+                try {
+                  const buffer = Buffer.concat(parts);
+                  const saved = await storage.putFile(newFilename, buffer, mimeType, uploadFolder);
+                  uploadedFiles.push({
+                    filename: newFilename,
+                    relative: saved.relative,
+                    folder: saved.folder || "",
+                    opts: fileOpts,
+                    size: saved.size,
+                    storage: saved.storage
                   });
+                  console.log(`File ${newFilename} disimpan ke ${saved.storage}${saved.folder ? `/${saved.folder}` : ""}`);
+                } catch (err) {
+                  console.error("Gagal menyimpan file:", err);
+                  uploadErrors.push(`Gagal menyimpan file ${newFilename}: ${err.message}`);
+                } finally {
+                  pendingUploads--;
+                  finishUpload();
+                }
+              });
+            });
+
+            const finishUpload = async () => {
+              if (!busboyFinished || pendingUploads !== 0 || signal.aborted) return;
+
+              // Simpan ke PostgreSQL via stored procedure (bulk)
+              if (uploadedFiles.length > 0) {
+                try {
+                  // Kirim path relatif MinIO (mis. foto/123_456.jpg atau 123_456.jpg) ke nmfile
+                  const orderedFiles = [...uploadedFiles].sort(
+                    (a, b) => a.index - b.index
+                  );
+
+                  const filenames = orderedFiles.map(
+                    f => f.relative || f.filename
+                  );
+
+                  const p_opts = orderedFiles.map(
+                    f => f.opts
+                  );
+                  await callProcedurePg("accurate.upload_bulk_save", [sessionId, filenames, uploadFolder, p_opts]);
+                  console.log(`${uploadedFiles.length} file records saved to PostgreSQL`);
+                } catch (dbErr) {
+                  console.error("Gagal menyimpan ke PostgreSQL:", dbErr);
+
+                  // Cleanup: Hapus file yang sudah terupload karena database gagal menyimpan recordnya
+                  for (const f of uploadedFiles) {
+                    try {
+                      await storage.removeFile(f.filename, f.folder);
+                    } catch (removeErr) {
+                      console.error(`Gagal menghapus file ${f.filename} saat cleanup:`, removeErr);
+                    }
+                  }
+
+                  if (!signal.aborted) {
+                    res.cork(() => {
+                      res.writeStatus("500 Internal Server Error");
+                      res.writeHeader("Content-Type", "application/json");
+                      res.end(JSON.stringify({
+                        success: false,
+                        message: "Gagal menyimpan data ke database.",
+                        dbError: dbErr.message,
+                        errors: uploadErrors
+                      }));
+                    });
+                  }
                   return;
                 }
+              }
+              if (uploadedFiles.length === 0 && uploadErrors.length > 0) {
                 res.cork(() => {
+                  res.writeStatus("500 Internal Server Error");
                   res.writeHeader("Content-Type", "application/json");
                   res.end(JSON.stringify({
-                    success: true,
-                    message: `${uploadedFiles.length} file berhasil diupload.`,
-                    storage: storage.isMinioEnabled ? "minio" : "local",
-                    files: uploadedFiles,
+                    success: false,
+                    message: uploadErrors[0],
                     errors: uploadErrors
                   }));
                 });
-              };
-
-              busboy.on("finish", () => {
-                busboyFinished = true;
-                finishUpload();
+                return;
+              }
+              res.cork(() => {
+                res.writeHeader("Content-Type", "application/json");
+                res.end(JSON.stringify({
+                  success: true,
+                  message: `${uploadedFiles.length} file berhasil diupload.`,
+                  storage: storage.isMinioEnabled ? "minio" : "local",
+                  files: uploadedFiles,
+                  errors: uploadErrors
+                }));
               });
+            };
 
-              busboy.on("error", (err) => {
-                console.error("Busboy error:", err);
-                if (!signal.aborted) {
-                  res.cork(() => {
-                    res.writeStatus("500 Internal Server Error");
-                    res.writeHeader("Content-Type", "application/json");
-                    res.end(JSON.stringify({ success: false, message: "Gagal memproses file." }));
-                  });
-                }
-              });
+            busboy.on("finish", () => {
+              busboyFinished = true;
+              finishUpload();
+            });
 
-              busboy.write(fullBuffer);
-              busboy.end();
+            busboy.on("error", (err) => {
+              console.error("Busboy error:", err);
+              if (!signal.aborted) {
+                res.cork(() => {
+                  res.writeStatus("500 Internal Server Error");
+                  res.writeHeader("Content-Type", "application/json");
+                  res.end(JSON.stringify({ success: false, message: "Gagal memproses file." }));
+                });
+              }
+            });
+
+            busboy.write(fullBuffer);
+            busboy.end();
           } catch (err) {
             console.error("Gagal memproses bulk upload:", err);
             if (!signal.aborted) {
@@ -982,6 +1023,7 @@ uWS
 
         // Bangun response dengan URL presigned (atau URL proxy)
         const files = [];
+        let fileIdx = 0;
         for (const row of rows) {
           const nmfile = row.nmfile;
           if (!nmfile) continue;
@@ -992,20 +1034,22 @@ uWS
           if (storage.isMinioEnabled) {
             url = await storage.getPresignedUrl(objName, 3600, folder);
           }
-          // URL proxy selalu tersedia sebagai fallback
+          // URL proxy selalu tersedia sebagai fallback.
           const proxyUrl = folder
-            ? `/accurate/uploads/${encodeURIComponent(folder)}/${encodeURIComponent(objName)}`
-            : `/accurate/uploads/${encodeURIComponent(objName)}`;
+            ? `/accurate/img/by-id?idest=${encodeURIComponent(row.idest)}&folder=${encodeURIComponent(folder)}&mode=stream&index=${fileIdx}`
+            : `/accurate/img/by-id?idest=${encodeURIComponent(row.idest)}&mode=stream&index=${fileIdx}`;
           files.push({
             nmfile,
             filename: objName,
             folder,
-            idest: row.idest,
+            id: row.idest,
             url: url || proxyUrl,
             proxyUrl,
             direct: !!url,
           });
+          fileIdx++;
         }
+
         if (!aborted) res.cork(() => {
           res.writeHeader("Content-Type", "application/json");
           res.end(JSON.stringify({ success: true, count: files.length, files }));
@@ -1020,7 +1064,86 @@ uWS
       }
     })();
   })
-  .get("/accurate/foto/by-id", (res, req) => {
+  .post("/accurate/fcm/send", (res, req) => {
+    const sessionId = getSessionId(req);
+    let aborted = false;
+    // Penting (uWebSockets): pasang onData/onAborted sinkron agar body tidak hilang
+    const bodyPromise = readBody(res);
+    res.onAborted(() => {
+      aborted = true;
+      console.log("Client aborted fcm send request");
+    });
+
+    (async () => {
+      try {
+        const raw = await bodyPromise;
+        if (!sessionId) {
+          if (!aborted) res.cork(() => {
+            res.writeStatus("401 Unauthorized");
+            res.writeHeader("Content-Type", "application/json");
+            res.end(JSON.stringify({ success: false, message: "Session tidak ditemukan." }));
+          });
+          return;
+        }
+        const sessionResult = await callProcedurePg("accurate.get_session", [sessionId]);
+        if (!sessionResult || !sessionResult[0]) {
+          if (!aborted) res.cork(() => {
+            res.writeStatus("401 Unauthorized");
+            res.writeHeader("Content-Type", "application/json");
+            res.end(JSON.stringify({ success: false, message: "Session tidak valid." }));
+          });
+          return;
+        }
+
+        let body = {};
+        try { body = JSON.parse(raw || "{}"); } catch { body = {}; }
+        const title = body.title;
+        const message = body.body || body.message;
+        const userId = body.userId ?? body.user_id;
+        let tokens = Array.isArray(body.tokens) ? body.tokens.filter(Boolean) : [];
+        const data = (body.data && typeof body.data === "object" && !Array.isArray(body.data)) ? body.data : {};
+
+        if (!title || !message) {
+          if (!aborted) res.cork(() => {
+            res.writeStatus("400 Bad Request");
+            res.writeHeader("Content-Type", "application/json");
+            res.end(JSON.stringify({ success: false, message: "Parameter title dan body wajib diisi." }));
+          });
+          return;
+        }
+        if (tokens.length === 0 && userId != null && String(userId).trim() !== "") {
+          tokens = await getTokensForUser(String(userId).trim());
+        }
+        if (tokens.length === 0) {
+          if (!aborted) res.cork(() => {
+            res.writeStatus("404 Not Found");
+            res.writeHeader("Content-Type", "application/json");
+            res.end(JSON.stringify({ success: false, message: "Token FCM tidak ditemukan." }));
+          });
+          return;
+        }
+
+        const dataPayload = {};
+        for (const [k, v] of Object.entries(data)) {
+          dataPayload[String(k)] = v == null ? "" : String(v);
+        }
+
+        const result = await sendNotification({ tokens, title, body: message, data: dataPayload });
+        if (!aborted) res.cork(() => {
+          res.writeHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ success: true, ...result }));
+        });
+      } catch (err) {
+        console.error("Gagal mengirim FCM:", err);
+        if (!aborted) res.cork(() => {
+          res.writeStatus("500 Internal Server Error");
+          res.writeHeader("Content-Type", "application/json");
+          res.end(JSON.stringify({ success: false, message: err.message }));
+        });
+      }
+    })();
+  })
+  .get("/accurate/img/by-id", (res, req) => {
     const sessionId = getSessionId(req);
     let aborted = false;
     // req tidak boleh diakses setelah await -> ambil query sekarang
@@ -1099,6 +1222,7 @@ uWS
 
         // Bangun response dengan URL presigned/proxy
         const files = [];
+        let fileIdx = 0;
         for (const row of rows) {
           const nmfile = row.nmfile;
           if (!nmfile) continue;
@@ -1110,8 +1234,8 @@ uWS
             url = await storage.getPresignedUrl(objName, 3600, folder);
           }
           const proxyUrl = folder
-            ? `/accurate/uploads/${encodeURIComponent(folder)}/${encodeURIComponent(objName)}`
-            : `/accurate/uploads/${encodeURIComponent(objName)}`;
+            ? `/accurate/img/by-id?idest=${encodeURIComponent(row.idest)}&folder=${encodeURIComponent(folder)}&mode=stream&index=${fileIdx}`
+            : `/accurate/img/by-id?idest=${encodeURIComponent(row.idest)}&mode=stream&index=${fileIdx}`;
           files.push({
             nmfile,
             filename: objName,
@@ -1121,9 +1245,43 @@ uWS
             proxyUrl,
             direct: !!url,
           });
+          fileIdx++;
+        }
+
+
+        // mode=stream: langsung stream gambar (berguna untuk proxyUrl di client yang tidak bisa akses MinIO)
+        if (mode === "stream") {
+          const idx = Math.max(0, parseInt(indexParam, 10) || 0);
+          const target = files[idx];
+          if (!target) {
+            if (!aborted) res.cork(() => {
+              res.writeStatus("404 Not Found").end("File tidak ditemukan.");
+            });
+            return;
+          }
+          const mimeMap = {
+            ".jpg": "image/jpeg", ".jpeg": "image/jpeg", ".png": "image/png",
+            ".gif": "image/gif", ".webp": "image/webp", ".svg": "image/svg+xml", ".pdf": "application/pdf"
+          };
+          const contentType = mimeMap[path.extname(target.filename).toLowerCase()] || "application/octet-stream";
+          const stream = await storage.getFileStream(target.filename, target.folder);
+          res.cork(() => {
+            res.writeHeader("Content-Type", contentType);
+            res.writeHeader("Cache-Control", "no-cache");
+          });
+          stream.on("data", (chunk) => {
+            if (!aborted) res.cork(() => { res.write(chunk); });
+          });
+          stream.on("end", () => { if (!aborted) res.cork(() => { res.end(); }); });
+          stream.on("error", (err) => {
+            console.error("Gagal stream gambar:", err);
+            if (!aborted) res.cork(() => { res.writeStatus("500 Internal Server Error").end(); });
+          });
+          return;
         }
 
         // mode=redirect: langsung 302 ke foto (index, default 0)
+        // Jika client tidak bisa akses MinIO (proxyUrl), redirect ke proxyUrl bukan presigned url.
         if (mode === "redirect" || mode === "302") {
           const idx = Math.max(0, parseInt(indexParam, 10) || 0);
           const target = files[idx];
@@ -1133,9 +1291,10 @@ uWS
             });
             return;
           }
+          const redirectTarget = (target.direct && !req.getQuery("proxy")) ? target.url : target.proxyUrl;
           if (!aborted) res.cork(() => {
             res.writeStatus("302 Found");
-            res.writeHeader("Location", target.url);
+            res.writeHeader("Location", redirectTarget);
             res.writeHeader("Cache-Control", "no-store");
             res.end();
           });
